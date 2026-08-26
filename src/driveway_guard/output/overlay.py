@@ -30,20 +30,6 @@ def draw_tracks(frame: np.ndarray, tracked_objects: list[TrackedObject]) -> np.n
     return frame
 
 
-def draw_skeleton(
-    frame: np.ndarray, keypoints_xy: list[tuple[float, float]], edges: list[tuple[int, int]]
-) -> np.ndarray:
-    for i, j in edges:
-        if i >= len(keypoints_xy) or j >= len(keypoints_xy):
-            continue
-        x1, y1 = keypoints_xy[i]
-        x2, y2 = keypoints_xy[j]
-        cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 2)
-    for x, y in keypoints_xy:
-        cv2.circle(frame, (int(x), int(y)), 3, (255, 0, 255), -1)
-    return frame
-
-
 def draw_text_banner(frame: np.ndarray, lines: list[str]) -> np.ndarray:
     for idx, line in enumerate(lines):
         y = 24 + idx * 22
