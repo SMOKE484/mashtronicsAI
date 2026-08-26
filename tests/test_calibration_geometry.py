@@ -26,12 +26,22 @@ def _straight_down_egress(corridor_width=200.0, corridor_length=500.0) -> Egress
     )
 
 
-def test_blocking_overlap_full_when_vehicle_centered_in_corridor():
-    egress = _straight_down_egress()
-    # A vehicle bbox centered on the corridor, well within its length range.
-    bbox = (450.0, 700.0, 550.0, 780.0)
+def test_blocking_overlap_full_when_vehicle_spans_corridor_width():
+    egress = _straight_down_egress(corridor_width=200.0)
+    # A vehicle bbox at least as wide as the 200px corridor, centered on
+    # it and well within its length range -> full coverage.
+    bbox = (350.0, 700.0, 650.0, 780.0)
     ratio = blocking_overlap_ratio(bbox, egress)
     assert ratio == 1.0
+
+
+def test_blocking_overlap_half_when_vehicle_narrower_than_corridor():
+    egress = _straight_down_egress(corridor_width=200.0)
+    # A 100px-wide bbox centered on a 200px corridor can only ever cover
+    # half of it, even though it's perfectly centered.
+    bbox = (450.0, 700.0, 550.0, 780.0)
+    ratio = blocking_overlap_ratio(bbox, egress)
+    assert abs(ratio - 0.5) < 1e-6
 
 
 def test_blocking_overlap_zero_when_far_outside_corridor_width():

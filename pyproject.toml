@@ -9,6 +9,7 @@ description = "Driveway camera anomaly detection: hijacking/boxing-in risk scori
 requires-python = ">=3.11"
 dependencies = [
     "ultralytics>=8.3",
+    "lap>=0.5.12",
     "opencv-python>=4.10",
     "numpy>=1.26",
     "pydantic>=2.7",
