@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# runtime artifacts
+out/
+data/input/
+data/samples/*.mp4
+data/samples/*.mov
+data/samples/*.avi
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# model weights (downloaded, not committed)
+*.pt
+*.onnx
+
+# editor/OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# packaging
+*.egg-info/
+build/
+dist/
