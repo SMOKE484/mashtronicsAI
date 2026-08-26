@@ -7,22 +7,38 @@ detection; updated again 2026-08-27 after a third session that: fixed a real
 bug in weapon detection, added and then fixed a new "vehicle flees after
 being surrounded" detection capability, designed (but did not yet build) a
 cross-event correlator, pushed everything to GitHub, and started a real-
-footage Kaggle testing round that is **currently blocked on an unexplained
-zero-events result** — see "Kaggle testing round 2" below, that's the most
-urgent thing to pick up. Written to be detailed enough that a new session
-doesn't need to re-derive anything by re-reading code or re-running commands
-that already have known answers below.
+footage Kaggle testing round that got **blocked on an unexplained
+zero-events result**. Updated again after a fourth session that picked up
+exactly there — ran the diagnostic that session 3 never got to, found and
+fixed a real gating bug it exposed, confirmed the weapon-detection
+checkpoint is genuinely working on real footage, then chased a user-reported
+"second gunman never detected" report all the way down to its actual root
+cause. See "Session 4" below — that section, not "Kaggle testing round 2",
+now reflects the current state and the current most-urgent next action.
+Written to be detailed enough that a new session doesn't need to re-derive
+anything by re-reading code or re-running commands that already have known
+answers below.
 
 **tl;dr of where things stand right now**: code is committed and pushed
-(`main` at `7f0477f`), 47/47 unit tests pass, but the pipeline has never
-been confirmed to actually produce a correct flagged event on real footage.
-Today's test batch (5 real sourced CCTV clips of hijackings + the earlier
-`Normal.mp4`) produced **0 events on all 6 clips**, including ones known to
-show an actual hijacking. A diagnostic already confirmed the detector *is*
-seeing people/vehicles in the footage (not a total failure), but the deeper
-diagnostic that would explain *why scoring never crosses threshold* was
-handed to the user and the session ended before it was run. That's the
-single highest-priority next action.
+(`main` at `d647e3f`), 50/50 unit tests pass. The zero-events mystery from
+session 3 is resolved: it was two things at once — a real gating bug in
+struggle scoring (now fixed) and thresholds/duration requirements that are
+simply stricter than what fast real-world footage produces. **Weapon
+detection is confirmed to genuinely work** — the retrained checkpoint found
+a real, clean, high-confidence gun detection in `video1.mp4`, it's just
+~0.18s short of the 0.5s duration the pipeline currently requires before
+flagging an event. Separately, the user visually confirmed `video1.mp4`
+actually shows **two** people holding guns, and a frame-level diagnostic
+proved the second one (dark clothing, low contrast, possibly partially
+occluded by the vehicle) was **never detected as a person at all** by the
+base tracker — not a weapon-detection bug, a person-detection/tracking
+recall gap. An experiment to test whether a lower detector confidence or a
+larger base model (`yolo11s.pt`) fixes that was handed to the user as ready-
+to-run Kaggle cells, and **the session ended before results came back**.
+That, plus two still-open threshold/design decisions (shorten
+`weapon_min_duration_s`; re-key `weapon_at_window` debouncing to
+vehicle-only to survive track-ID churn), are the highest-priority next
+actions — see "Session 4" and "Next steps" below.
 
 ## What this project is
 
@@ -179,6 +195,46 @@ brainstorm:
   (`yolo11n.pt`, `yolo11n-pose.pt`) were chosen specifically for this. The
   user tests on **Kaggle notebooks** (free T4 GPU) instead of running
   inference locally, because local free RAM is tight (see below).
+- **Struggle's dwell gate was comparing against the wrong proximity zone —
+  fixed session 4.** `score_struggle()` (`scoring/rules.py`) requires, on
+  the same frame, both `person_vehicle_distance_norm ≤
+  proximity_norm_threshold` (0.08 — genuinely close) and `dwell_time_s ≥
+  struggle_dwell_min_s` (1.5s — sustained). The bug: `dwell_time_s`
+  (`features/extractor.py`) was tracked against `_RECORD_PROXIMITY_NORM`
+  (0.5 — a much looser "is this pair even worth recording" zone, deliberately
+  wide so approach/sprint/convergence signals are captured before someone
+  reaches the vehicle), not the strict 0.08 struggle zone. So a person could
+  dwell near the car for 6+ seconds without that dwell ever coinciding with
+  a frame where they were also within 0.08 — the two gates were checking
+  different notions of "close" and rarely lined up. Confirmed directly
+  against real footage (`video3.mp4` from "Kaggle testing round 2" below):
+  `max_dwell_s` (loose zone) reached 6.59s while `min_distance_norm` only
+  ever dropped to 0.06 briefly, and `max_struggle_score` stayed exactly 0.0
+  the entire clip. **Fix**: added a second field,
+  `FrameFeatureVector.close_dwell_time_s`, tracked by a second
+  `ProximityDwellTracker` keyed to a new `FeatureExtractor.__init__`
+  parameter `close_proximity_norm` (default 0.08, matching
+  `RuleThresholds.proximity_norm_threshold`). `run.py` now builds one
+  `RuleThresholds` instance and passes `thresholds.proximity_norm_threshold`
+  into `FeatureExtractor` explicitly, so the two proximity notions used by
+  the extractor and the scorer share a single source of truth and can't
+  silently drift apart again. `score_struggle()`'s two `dwell_time_s` checks
+  (the proximity+dwell gate, and the `person_person_contact` contact-term
+  check) now both read `close_dwell_time_s` instead. The old loose
+  `dwell_time_s` field is kept as-is (still useful as a wider-context
+  training-row signal, nothing else consumes it). 3 new tests added (2 in
+  `test_feature_extractor.py` covering the extractor-level distinction, 1
+  regression test in `test_rule_scorer.py` reproducing the exact bug
+  pattern: high loose dwell + low close dwell ⇒ struggle score must stay
+  0). 50/50 tests passing. Committed as `fc804fa`.
+  **Re-tested against real footage post-fix** (unlike the weapon-class-filter
+  fix above, which still hasn't been) — see "Session 4" below:
+  `close_dwell_time_s` now correctly reports the true (much shorter, 0.44s)
+  close-proximity duration on `video3.mp4`, confirming the fix works as
+  intended. Struggle still scores 0 on that clip, but now for a real,
+  understood reason (the interaction is fast, not sustained) rather than a
+  gating bug — see "Session 4" for why that's actually a tuning question now,
+  not a code defect.
 
 ## Real-world hijacking chronology (reference material, sourced this session)
 
@@ -319,15 +375,56 @@ src/driveway_guard/
 │   └── event_log.py             # events.json / events.csv writers
 └── imaging.py                  # shared crop_with_padding() used by pose + weapon detector
 
-scripts/
-└── train_weapon_model.py       # standalone utility (NOT part of the driveway_guard
-                                 #   package, not imported anywhere at pipeline runtime).
-                                 #   Fine-tunes a YOLO checkpoint on any YOLO-format
-                                 #   dataset. Full CLI/behavior documented in the
-                                 #   "Weapon detection" section below.
+scripts/                         # all standalone utilities below: NOT part of the
+                                 #   driveway_guard package, not imported anywhere at
+                                 #   pipeline runtime, each has its own --help via argparse.
+├── train_weapon_model.py       # Fine-tunes a YOLO checkpoint on any YOLO-format
+│                                #   dataset. Full CLI/behavior in "Weapon detection" below.
+├── diagnose_pipeline.py         # Added session 4. Runs the full detection/pose/weapon/
+│                                #   feature/scoring pipeline across a whole clip and
+│                                #   reports the BEST value every signal ever reached
+│                                #   (min_distance_norm, max_close_dwell_s, max_dwell_s,
+│                                #   max_approach_speed_px_s, max_struggle_score,
+│                                #   max_sprint_score, max_weapon_score,
+│                                #   max_convergence_approachers/spread_deg/score,
+│                                #   frames_with_pair), bypassing EventAggregator's
+│                                #   threshold+debounce entirely. This is "Diagnostic 2"
+│                                #   from "Kaggle testing round 2" below, committed this
+│                                #   time instead of being left in a chat transcript.
+│                                #   Optional --out writes the summary as JSON.
+├── inspect_weapon_hits.py       # Added session 4. Runs only Tracker + WeaponDetector
+│                                #   (skips pose/features) and prints every individual
+│                                #   raw weapon-detector hit, frame by frame, with
+│                                #   timestamp + confidence + which person track. Reports
+│                                #   the longest continuous run of consecutive
+│                                #   above-threshold frames, converted to seconds, so a
+│                                #   single-frame spike can be told apart from a genuine
+│                                #   sustained detection. See "Session 4" below for what
+│                                #   this revealed on video1/video3.
+├── export_weapon_snapshots.py   # Added session 4. Picks the N highest-confidence
+│                                #   weapon hits on a clip (at least --min-gap-s apart in
+│                                #   time, to avoid near-duplicate consecutive frames),
+│                                #   draws the weapon/person boxes, and saves a full-frame
+│                                #   PNG + a padded close-up crop for each — for visually
+│                                #   confirming a hit is really a gun. Set --count high and
+│                                #   --min-gap-s 0 to export literally every hit instead of
+│                                #   a representative sample.
+└── inspect_frame.py             # Added session 4. Deep-dive on one exact frame
+                                 #   (--frame-idx or --at-seconds): lists every tracked
+                                 #   person/vehicle, whether each person was gated as
+                                 #   "near a vehicle" for weapon checking at all, and (if
+                                 #   --weapon-model given) EVERY raw box the weapon model
+                                 #   found in each gated person's crop — not just the
+                                 #   single top-1 confidence box WeaponDetector.detect()
+                                 #   actually keeps. Also writes an annotated PNG. Built to
+                                 #   tell apart three failure modes that all look identical
+                                 #   from events.json alone: a person never tracked at all,
+                                 #   tracked-but-gated-out, or tracked+gated+detected but
+                                 #   silently dropped by the top-1-per-crop logic. See
+                                 #   "Session 4" below for the real finding on video1.
 
 calib/example_driveway.json     # placeholder calibration, 1920x1080 — must match your video's exact resolution or it errors loudly
-tests/                          # 47 passing unit tests, no video/model needed (pure logic)
+tests/                          # 50 passing unit tests, no video/model needed (pure logic)
 ```
 
 CLI: `python -m driveway_guard.run --video <path> --out <dir> [--calib <path>] [--weapon-model <path>] [--device cpu|cuda:0] ...`
@@ -351,33 +448,47 @@ log lines.
 ## Current status
 
 - All v1 milestones from the plan are built (scaffolding through polish).
-- **47/47 local pytest tests passing** (pure-logic tests only — geometry,
+- **50/50 local pytest tests passing** (pure-logic tests only — geometry,
   scorer, track state, feature extractor, event debounce; no video/model
-  dependency). 5 new tests added this session (weapon-class-filter fix had
-  no dedicated test — `WeaponDetector` needs a real `.pt` to instantiate,
-  untested at unit level; convergence fleeing-bonus + recently-surrounded
-  fix added 5 tests). Confirmed passing (`.venv/Scripts/python.exe -m
-  pytest -q` → `47 passed`) before committing.
+  dependency). 3 new tests added session 4 for the struggle dwell-gate fix
+  (2 extractor-level, 1 scorer-level regression test — see "Key design
+  decisions" above). Confirmed passing (`.venv/Scripts/python.exe -m
+  pytest -q` → `50 passed`) before every commit.
 - Pushed to GitHub: **https://github.com/SMOKE484/mashtronicsAI** (public
-  repo). `main` is up to date through commit `7f0477f`. Full commit
-  history as of end of session:
+  repo). `main` is up to date through commit `d647e3f`. Full commit
+  history as of end of session 4:
   - `b2f156b` — "Add v1 driveway anomaly detection pipeline" (session 1)
   - `30ff36a` — "Declare lap dependency explicitly; fix blocking-overlap
     test expectation" (session 2)
   - `7fa9c2f` — "Add weapon detection training script and sourcing docs"
     (session 2)
   - `7f0477f` — "Fix weapon class filtering; detect vehicle fleeing after
-    convergence" (session 3, this session) — bundles the
-    `WeaponDetector` non-threat-class-denylist fix, the convergence
-    fleeing-bonus + recently-surrounded-decoupling fix, and the `run.py`
-    flagged-events console summary. 10 files changed. See "Key design
-    decisions" above for the full rationale on each piece.
-  - No uncommitted changes as of the end of this session — `git status`
-    was clean after the push. (An `output.txt` scratch file — a pasted
-    Kaggle training log — is untracked and deliberately excluded from
-    every commit; harmless to delete if it's cluttering the working tree.)
-- **Two real end-to-end Kaggle test rounds so far, neither has produced a
-  confirmed-correct flagged event yet:**
+    convergence" (session 3) — bundles the `WeaponDetector`
+    non-threat-class-denylist fix, the convergence fleeing-bonus +
+    recently-surrounded-decoupling fix, and the `run.py` flagged-events
+    console summary. 10 files changed.
+  - `fc804fa` — "Fix struggle dwell gate comparing against wrong proximity
+    zone" (session 4) — the `close_dwell_time_s` fix, see "Key design
+    decisions" above. 7 files changed, 3 new tests.
+  - `52042d6` — "Commit the zero-events diagnostic script instead of
+    leaving it in chat" (session 4) — adds `scripts/diagnose_pipeline.py`.
+  - `12dc4b6` — "Add frame-by-frame weapon hit inspector" (session 4) —
+    adds `scripts/inspect_weapon_hits.py`.
+  - `c11d62f` — "Add weapon-hit snapshot exporter for visual spot-checking"
+    (session 4) — adds `scripts/export_weapon_snapshots.py`.
+  - `d647e3f` — "Add single-frame deep-dive to diagnose the second-gun-
+    missed report" (session 4) — adds `scripts/inspect_frame.py`.
+  - No uncommitted changes as of the end of session 4 — `git status` was
+    clean after the last push. (An `output.txt` scratch file — pasted
+    Kaggle terminal output, most recently the weapon-hit-inspector results
+    — is untracked and deliberately excluded from every commit; harmless
+    to delete if it's cluttering the working tree, or leave it, it keeps
+    getting overwritten with whatever was last pasted.)
+- **Three real end-to-end Kaggle test rounds so far.** Weapon detection is
+  now confirmed to genuinely detect real weapons on real footage (round 3);
+  the other four event types still have not produced a single confirmed-
+  correct flagged event on real footage, though round 3 now explains why in
+  concrete, per-signal terms rather than a mystery zero:
   - **Round 1** (session 2): `Normal.mp4` (`training1` Kaggle dataset,
     real mount path
     `/kaggle/input/datasets/vhulendamashamba/training1/Normal.mp4` — the
@@ -385,14 +496,26 @@ log lines.
     `find /kaggle/input/ -iname "*.mp4"`). Ran cleanly through 300+
     frames, 0 events flagged. Never visually confirmed whether detection
     was actually working — annotated.mp4 from that run was never reviewed.
-  - **Round 2** (this session, **in progress, unresolved** — see dedicated
-    section below): batch of 6 clips including 5 real sourced hijacking
-    videos, also 0 events across the board. This time a diagnostic *did*
-    confirm the detector sees people/vehicles in at least one of the
-    clips, so it's not a total detection failure — but the deeper
-    diagnostic needed to explain the zero-events result was handed to the
-    user and not yet run before the session ended. **This is the most
-    important thing to pick up next.**
+  - **Round 2** (session 3): batch of 6 clips including 5 real sourced
+    hijacking videos, 0 events across the board, cause not yet identified
+    — see "Kaggle testing round 2" below for the full historical record of
+    that investigation (still accurate as a record of what was tried and
+    found; superseded as a statement of current priority by "Session 4"
+    below).
+  - **Round 3 (session 4 — resolved, see "Session 4" below for full
+    detail)**: re-ran the "Diagnostic 2" script session 3 never got to run
+    (now `scripts/diagnose_pipeline.py`), found and fixed the struggle
+    dwell-gate bug, then used two new inspection scripts to confirm the
+    retrained weapon checkpoint is genuinely detecting real guns in
+    `video1.mp4` and `video3.mp4` — just not for long enough, continuously,
+    to survive the pipeline's 0.5s debounce. A follow-up user report ("two
+    people had guns, only one was detected") led to a frame-level
+    diagnostic that found the second gunman (dark clothing, low contrast)
+    was never detected as a person at all by the base tracker — a
+    detection/tracking recall gap, not a weapon-detection bug. An
+    experiment to test a lower detector confidence and a larger base model
+    was handed to the user as ready-to-run cells; **results not yet back
+    when the session ended.**
 
 ## Weapon detection (picked up this session — training done, wiring/spot-check not done)
 
@@ -669,12 +792,19 @@ proceeded without it.
    page (not the notebook's read-only Input side-panel) and whether their
    account has phone verification completed, if it's still blocking them.
 
-## Kaggle testing round 2 (this session — IN PROGRESS, UNRESOLVED, pick up here)
+## Kaggle testing round 2 (session 3 — historical record; resolved in "Session 4" below)
 
-This is the active thread and the single most important thing to continue.
+**Status update from session 4**: the "Diagnostic 2" script this section
+describes as not-yet-run *was* run in session 4 (as the newly-committed
+`scripts/diagnose_pipeline.py`), and the zero-events mystery is resolved —
+see "Session 4" below for the actual results and what they meant. This
+section is kept as-is as the historical record of round 2's setup and
+Diagnostic 1, which are both still accurate; only Diagnostic 2's "NOT YET
+RUN" status below is stale.
+
 Goal: run the pipeline against real sourced hijacking footage and confirm
-events actually fire correctly. Result so far: **0 events on every clip
-tested**, cause not yet identified.
+events actually fire correctly. Result at the time: **0 events on every
+clip tested**, cause not yet identified.
 
 ### Security note (unresolved — check this first)
 
@@ -748,12 +878,15 @@ proximity timers that `struggle` and `boxing_in` depend on
 (`ProximityDwellTracker.update()` zeroes the clock the instant a pair
 isn't "active" for even one frame).
 
-### Diagnostic 2 — the critical next step, NOT YET RUN
+### Diagnostic 2 — run in session 4, see "Session 4" below for results
 
 A second, deeper diagnostic script was written and handed to the user as
 "cell 8," but **the session ended before it was run and before any results
-came back**. This is the actual next action for the next session. It runs
-the full `Tracker` + `PoseEstimator` + `FeatureExtractor` +
+came back**. *(Session 4 update: it was run, on `video3.mp4` — see
+"Session 4" below for the actual numbers and what they revealed. The
+description of what the script does, immediately below, is unchanged; it's
+now committed as `scripts/diagnose_pipeline.py` instead of living only in a
+chat transcript.)* It runs the full `Tracker` + `PoseEstimator` + `FeatureExtractor` +
 `compute_convergence` + raw `score_struggle`/`score_sprint`/
 `score_convergence` (bypassing `EventAggregator`'s threshold+debounce
 entirely) across the **whole** clip (not just 60 frames), and tracks the
@@ -825,6 +958,208 @@ diagnostic-style cell.
 8. Diagnostic 2 (full feature+scoring pipeline, whole clip, max-value
    tracking) — **written and handed to the user, not yet run**. This is
    where the session ended.
+
+## Session 4 (picks up exactly where session 3 left off — READ THIS FIRST for current state)
+
+Continuation of the same Kaggle notebook/session the user had open at the
+end of session 3 (same `/kaggle/working/mashtronicsAI` checkout, same
+`hijackings` dataset already attached). Four things happened in order:
+the zero-events mystery got resolved, a real code bug got fixed, weapon
+detection got confirmed to actually work, and a user-reported "second gun
+missed" observation got traced to its real root cause. Ends with an
+experiment handed to the user, unrun.
+
+### 1. Diagnostic 2 finally ran, on `video3.mp4`
+
+Result (whole clip, `EventAggregator` bypassed):
+```
+min_distance_norm: 0.0606695288833145
+max_dwell_s: 6.585891089108912
+max_approach_speed_px_s: 1683.930407390042
+max_struggle_score: 0.0
+max_sprint_score: 1.0
+max_convergence_approachers: 2
+max_convergence_spread_deg: 24.26892617080597
+max_convergence_score: 0.0
+frames_with_pair: 536
+```
+Reading this against the reference thresholds (`proximity_norm_threshold`
+0.08, `struggle_dwell_min_s` 1.5, `sprint_speed_px_s_threshold` 650,
+`convergence_angle_threshold_deg` 90, `risk_score_flag_threshold` 0.65):
+
+- **Struggle stayed 0.0 despite both individual gates looking satisfied**
+  (`min_distance_norm` 0.06 < 0.08; `max_dwell_s` 6.59 > 1.5) — this
+  contradiction is exactly what led to finding the dwell-gate bug (see "Key
+  design decisions" above): the two numbers were never true on the *same*
+  frame, because `dwell_time_s` was measuring a much looser proximity zone
+  than the 0.08 the distance gate checks.
+- **Sprint hit a perfect 1.0** (`max_approach_speed_px_s` 1683, over double
+  `sprint_speed_px_s_threshold`) — but recall this bypasses debounce, so it
+  doesn't by itself mean an event would have fired; a single-frame spike
+  (e.g. a tracker ID jump) wouldn't survive `EventAggregator`'s
+  ≥2-consecutive-samples / ≥`event_min_duration_s` (0.3s) requirement. Not
+  independently re-verified this session which case it was — worth checking
+  before trusting sprint detection on this clip.
+- **Convergence's angular spread topped out at 24° vs. the 90° gate** —
+  `num_simultaneous_approachers` did reach the required 2, but they
+  approached from similar angles rather than opposite flanks. Given the
+  user later confirmed (see below) the victim never left the vehicle,
+  this is consistent with both attackers converging on the same side/window
+  rather than surrounding the car from multiple directions — the scenario
+  `multi_directional_convergence` is shaped for may just not be what this
+  clip shows, rather than a bug.
+
+### 2. Struggle dwell-gate bug found and fixed
+
+Covered in full under "Key design decisions" above (the `close_dwell_time_s`
+bullet) — don't duplicate here, just the headline: `dwell_time_s` was
+measuring the wrong (too loose) proximity zone, fixed, 3 new tests, commit
+`fc804fa`, pushed.
+
+**Re-running Diagnostic 2 on the same clip post-fix** (this is the
+important confirmation step — the fix was verified against real footage,
+not just unit tests):
+```
+min_distance_norm: 0.0606695288833145
+max_dwell_s: 6.585891089108912
+max_close_dwell_s: 0.43905940594059345    <-- NEW, this is the fixed field
+max_approach_speed_px_s: 1683.930407390042
+max_struggle_score: 0.0
+max_sprint_score: 1.0
+max_weapon_score: 0.6758406758308411      <-- weapon model now wired in, see below
+max_convergence_approachers: 2
+max_convergence_spread_deg: 24.26892617080597
+max_convergence_score: 0.0
+```
+`close_dwell_time_s` (the correctly-gated field) tops out at **0.44s** —
+far below the old misleading `max_dwell_s` of 6.59s. This confirms the fix
+works: it's now telling the truth about how long the person was actually
+*close*, not how long they were merely somewhere in the wide recording
+zone. Struggle still scores 0, but now for a real, legible reason: nobody
+held tight proximity to the vehicle continuously for anywhere near the
+required 1.5 seconds. **The user's own read on why, independently
+volunteered**: in this clip the driver never gets out of the car — she
+stays seated, the attacker reaches in/at the window. That matches the
+data — a quick reach-and-point is not the sustained two-people-in-contact
+struggle the `struggle` event type's formula assumes (it needs either
+`person_person_contact`, which requires a second distinct visible person
+track, or pose-derived arm-raise/joint-velocity signals from an exposed
+person — neither holds up well for "attacker leans into a window at a
+seated victim"). **This is `weapon_at_window`'s actual scenario**, which is
+exactly what got checked next.
+
+**Also notable**: `max_weapon_score` is now 0.676, clearing
+`weapon_confidence_threshold` (0.5) — first real positive signal of the
+whole testing effort. But the full batch run (with `--weapon-model` wired
+in, no `--calib` still — see "Kaggle testing round 2" setup notes above for
+why) still produced **0 events on all 6 clips**. That gap — a max score
+above threshold but still no event — is exactly what section 3 below
+digs into.
+
+### 3. Weapon detection confirmed genuinely working — it's a duration/tracking problem, not a detection failure
+
+New script `scripts/inspect_weapon_hits.py` (committed `12dc4b6`) prints
+every individual raw weapon-model hit frame-by-frame and reports the
+longest unbroken run of consecutive above-threshold frames, converted to
+seconds. Run on both `video1.mp4` and `video3.mp4` (the two clips the user
+independently confirmed show a gun at the window):
+
+**video1.mp4** (816x448, ~40.5fps, 595 frames):
+- Two bursts: t≈5.0–6.1s (person track 9, confidence 0.53–0.72, patchy) and
+  a much stronger one at t≈9.8–11.7s (person track 14).
+- Inside the second burst, **frames 461–474 (t=11.39s–11.71s) are 14
+  consecutive frames, every single one ≥0.5 confidence**, several 0.6–0.83,
+  zero dips. Genuinely clean, confident, sustained-looking detection.
+- Problem: 14 frames at ~41fps is only **0.32 seconds** of real time.
+  `weapon_min_duration_s` requires **0.5s** continuous. This is a real
+  detection that's simply shorter than the debounce window assumes — not a
+  detector failure.
+- Summary: `frames_with_hit_above_score_threshold=28`,
+  `longest_continuous_run_above_threshold_s=0.32`, `max_confidence_seen=0.828`.
+
+**video3.mp4** (640x480, ~41fps, 1212 frames):
+- Weaker and choppier: longest clean run only **0.17s**.
+- **Track-ID churn**: hits land on five different person track IDs (31, 35,
+  37, 38, 45) across t=16.0–19.6s (~3.5s span) — the tracker is losing and
+  re-acquiring what's plausibly the same person, likely from occlusion by
+  the vehicle or another person. Since `weapon_at_window`'s debounce state
+  in `EventAggregator` is keyed by `(person_track_id, vehicle_track_id)`,
+  every ID switch resets accumulated duration back to zero regardless of
+  confidence — compounding the already-short detection windows.
+- Summary: `frames_with_hit_above_score_threshold=19`,
+  `longest_continuous_run_above_threshold_s=0.17`, `max_confidence_seen=0.676`.
+
+**Two design decisions were surfaced but explicitly left open, pending user
+confirmation — do not silently pick one without checking**:
+1. Lower `weapon_min_duration_s` (currently 0.5s) — video1's clean 0.32s
+   run is real, concrete evidence it may be calibrated too strict for fast
+   real-world gun-at-window moments. ~0.3s was the number discussed but not
+   agreed.
+2. Re-key `weapon_at_window`'s `EventAggregator` state to the vehicle
+   alone (matching the precedent already set by convergence's
+   "recently surrounded" fix — see "Key design decisions" above), instead
+   of `(person, vehicle)`, so tracker ID churn like video3's doesn't reset
+   progress. Not yet implemented.
+
+The user asked to have the results explained in plain language before any
+fix was proposed (both explanations were given, in full, in-conversation —
+not reproduced here); **no final decision was made on either point before
+the session moved on** to the next finding below. Both are open decisions
+for the next session — see "Next steps".
+
+### 4. "Two people had guns, only one detected" — traced to a person-detection miss, not a weapon-detection bug
+
+New script `scripts/export_weapon_snapshots.py` (committed `c11d62f`) was
+used first to export/view the highest-confidence weapon hits from video1 as
+annotated images. After reviewing them, **the user reported that video1
+actually shows two people holding guns at once, and only one was ever
+flagged** — with a specific, important detail: the second person was
+wearing all-black clothing, holding a black gun, pointed at the window.
+
+Built `scripts/inspect_frame.py` (committed `d647e3f`) to isolate exactly
+which of three possible causes this was (they're indistinguishable from
+`events.json` alone): the second person never tracked at all; tracked but
+gated out (not counted as "near a vehicle", so the weapon model never even
+ran on their crop); or tracked, gated, and detected, but silently dropped
+because `WeaponDetector.detect()` only keeps the single highest-confidence
+threat box per person crop (relevant if two people end up in the same
+padded crop).
+
+Ran it at t=11.5s on video1 (the frame with the 0.828-confidence hit). The
+annotated output showed **only one green "person" box** (around the
+lighter-clothed person reaching toward the window, with the weapon box
+correctly drawn at confidence 0.62) — **the person in black near the
+driver's door had no bounding box at all**. Confirmed: this is cause #1,
+**the base tracker's person detector never detected the second person as a
+person in this frame, at all**. Weapon detection never had a chance to run
+on them, because it only ever runs on already-tracked, already-gated
+persons — this is upstream of anything weapon-specific.
+
+Likely explanation (not yet confirmed): low contrast between dark clothing
+and a dark gun/shadowed area, possibly combined with partial occlusion by
+the vehicle from this camera's angle — a known hard case for the small
+"nano" COCO detector (`yolo11n.pt`) used for the base person/vehicle
+tracker (this is unrelated to the weapon model's own recall gap discussed
+in "Weapon detection" below — this miss happens one stage earlier, before
+the weapon model is ever invoked).
+
+**Experiment designed but not yet run** — handed to the user as ready
+Kaggle cells, session ended before results came back:
+- Re-run `inspect_frame.py` on the same t=11.5s frame of video1 with
+  `--tracker-conf 0.15` (down from the default 0.35) — tests whether this
+  is simply a confidence-threshold tuning issue.
+- Also try `--detector-model yolo11s.pt` (a larger YOLO11 variant than the
+  nano model currently used everywhere, still Kaggle-GPU-lightweight) —
+  tests whether it's a base-model capacity limitation instead.
+- Also try both together.
+- **If the person still isn't detected even with a bigger model and lower
+  confidence**, that would point toward a genuine training-data-level gap
+  in the base detector for this kind of low-contrast/occluded case — not
+  fixable by a config change, would need either a fine-tuned person
+  detector or accepting the limitation.
+
+**This is the single most important next action** — see "Next steps"
+below.
 
 ## Synthetic test clip prompts (drafted this session, not currently the priority)
 
@@ -906,7 +1241,7 @@ needed.
   sluggish; `--frame-stride` exists as an escape hatch if needed.
 - Disk space is not a concern (397 GB free of 475 GB at last check).
 
-## Kaggle workflow (validated as working across three sessions now)
+## Kaggle workflow (validated as working across four sessions now)
 
 1. New notebook → Accelerator: GPU T4 x2 → Internet: On.
 2. If `/kaggle/working/mashtronicsAI` doesn't already exist:
@@ -952,48 +1287,55 @@ needed.
 
 ## Next steps (in priority order)
 
-1. **Run "Diagnostic 2" from "Kaggle testing round 2" above.** This is the
-   single most important next action — everything else is downstream of
-   knowing *why* 0 events fired on real hijacking footage. The script is
-   already written (see that section, or search the conversation
-   transcript for "Cell 8"), just needs to actually be run and its output
-   compared against the reference thresholds listed there.
-2. Based on diagnostic 2's result, branch:
-   - **Scores close but under threshold** → tune `RuleThresholds` in
-     `scoring/rules.py` (they're explicitly "starting guesses," never
-     validated against real footage before now) and re-run.
-   - **Scores nowhere close** → investigate detection/tracking robustness
-     on real (lower-res, compressed) CCTV footage specifically — likely
-     candidates: intermittent detection breaking continuity-based dwell
-     timers (see diagnostic 1's 40/60-frame vehicle detection rate at a
-     borderline 0.37 confidence), pose estimation failing more often on
-     compressed footage, or a genuine framing/distance mismatch between
-     what the thresholds assume and what this footage actually shows.
-     Consider trying a lower `--conf` as a quick experiment either way.
-3. Build a calibration JSON matching the `hijackings` dataset's actual
+1. **Run the person-detection experiment from "Session 4" section 4
+   above — the single most important next action.** On `video1.mp4` at
+   t=11.5s, re-run `scripts/inspect_frame.py` with `--tracker-conf 0.15`,
+   then with `--detector-model yolo11s.pt`, then both together, to find out
+   whether the missed second gunman (dark clothing, low contrast, no person
+   box at all from the base tracker) is a cheap confidence-threshold fix, a
+   base-model-capacity issue, or a deeper training-data gap that needs
+   neither knob. Exact ready-to-paste cells were handed to the user; just
+   need the results read back and interpreted.
+2. Resolve the two open weapon-detection design decisions from "Session 4"
+   section 3 above (both were explained to the user but never decided):
+   - Whether to lower `weapon_min_duration_s` (0.5s → ~0.3s was discussed),
+     backed by video1's genuine, clean, uninterrupted 0.32s detection run
+     that only just missed the current bar.
+   - Whether to re-key `weapon_at_window`'s `EventAggregator` state to the
+     vehicle alone instead of `(person, vehicle)`, mirroring the precedent
+     already set by convergence's "recently surrounded" fix, so video3's
+     person-ID churn (5 different track IDs in ~3.5s) stops resetting
+     accumulated duration. Both are `scoring/rules.py` / `scoring/events.py`
+     changes, not big ones, but they're judgment calls about the
+     false-positive/false-negative tradeoff — confirm before implementing,
+     don't just pick one.
+3. Once 1 and 2 are settled, re-run the full 6-clip batch (with
+   `--weapon-model` wired in, still no `--calib`) and check whether
+   `video1.mp4`/`video3.mp4` finally produce a real, correct
+   `weapon_at_window` flagged event — this would be the first
+   confirmed-correct detection of the entire testing effort.
+4. Decide whether `struggle_dwell_min_s` (1.5s) also needs lowering for
+   fast real-world interactions, now that `close_dwell_time_s` is reporting
+   accurate numbers (video3's real max was 0.44s) — same category of
+   decision as weapon's duration threshold above, likely worth tuning both
+   together rather than separately.
+5. Build a calibration JSON matching the `hijackings` dataset's actual
    640x480 resolution (the existing `calib/example_driveway.json` is
    1920x1080 and won't work) if boxing-in and the convergence
    fleeing-signal are to be tested against this footage — currently
    neither has been exercised at all on real footage.
-4. Retrain the weapon checkpoint (lost this session, see "Weapon
-   detection" section) **and this time save `weapon_model.pt` as a
-   proper Kaggle Dataset**, not just `/kaggle/working`, before wiring it
-   back in via `--weapon-model` and spot-checking.
-5. Once individual events are confirmed firing correctly on real footage,
+6. Confirm whether the exposed Roboflow API key (see "Security note" under
+   "Kaggle testing round 2" above) was actually rotated — still unconfirmed,
+   carried forward from session 3 unresolved.
+7. Once individual events are confirmed firing correctly on real footage,
    build the cross-event correlator — full design already agreed with the
-   user, documented in "Cross-event correlator" above, not yet
-   implemented. Confirm the user still wants it before building (it's
-   very likely yes, but confirm rather than assume after a gap in the
-   conversation).
-6. Confirm whether the exposed Roboflow API key (see "Security note" in
-   "Kaggle testing round 2" above) was actually rotated — unconfirmed as
-   of end of session.
-7. Once the above is solid, the previously-agreed testing roadmap
+   user, documented in "Cross-event correlator" above, not yet implemented.
+   Confirm the user still wants it before building (very likely yes, but
+   confirm rather than assume after a gap in the conversation).
+8. Once the above is solid, the previously-agreed testing roadmap
    continues: a person actively approaching/interacting with a vehicle →
    a busier benign clip (multiple people, false-positive check) → real
    struggle/aggressive-approach footage for further tuning.
-8. Older still-open loose end: visually confirm the very first Kaggle run
-   (`Normal.mp4`, session 2) actually showed correct detection in its
-   `annotated.mp4` — never reviewed. Lower priority now that diagnostic 1
-   this session at least confirms detection works on *some* real footage,
-   but still an open item for that specific clip.
+9. Older still-open loose end, low priority: visually confirm the very
+   first Kaggle run (`Normal.mp4`, session 2) actually showed correct
+   detection in its `annotated.mp4` — never reviewed.
