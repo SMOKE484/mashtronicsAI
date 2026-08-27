@@ -34,6 +34,19 @@ Outputs land in the `--out` directory: `annotated.mp4` (boxes/tracks/overlay),
 and, once later milestones land, `events.json` / `events.csv` (flagged
 candidate events) and `run_meta.json`.
 
+## Diagnosing a clip with 0 flagged events
+
+`scripts/diagnose_pipeline.py` runs the same detection/pose/weapon/scoring
+stages as the real pipeline but reports the *best* value each signal ever
+reached across the whole clip, bypassing `EventAggregator`'s debounce.
+Compare its output against `RuleThresholds` (also printed) to tell a
+tuning problem (scores close but under threshold) from a detection/
+tracking robustness problem (scores nowhere close):
+
+```
+python scripts/diagnose_pipeline.py --video path\to\clip.mp4 [--weapon-model weapon_model.pt] [--calib calib.json] --device cuda:0
+```
+
 ## Weapon detection model
 
 `--weapon-model` takes a YOLO checkpoint fine-tuned for weapons; the stage
