@@ -36,6 +36,13 @@ class FeatureExtractor:
             self._histories[track_id] = TrackHistory()
         return self._histories[track_id]
 
+    def vehicle_velocity_px_s(self, track_id: int) -> tuple[float, float]:
+        """Current velocity for a tracked vehicle, independent of whether
+        any person is currently near it — needed to detect a vehicle
+        fleeing after everyone who was surrounding it has already gotten
+        in (and so no longer shows up as an "approaching person")."""
+        return self._history(track_id).velocity_px_s()
+
     def extract_pairs(
         self,
         frame_idx: int,

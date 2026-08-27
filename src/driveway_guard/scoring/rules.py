@@ -35,6 +35,23 @@ class RuleThresholds:
     # multi-directional convergence
     convergence_angle_threshold_deg: float = 90.0
     convergence_min_approachers: int = 2
+    # bonus when the vehicle is also moving in the egress direction (i.e.
+    # driving/backing out of the driveway) while surrounded — a resident
+    # attempting to flee under duress, not just a stationary convergence.
+    # Requires calibration (egress_path); no-op without it.
+    convergence_egress_speed_px_s_threshold: float = 60.0
+    convergence_fleeing_bonus: float = 0.35
+    # If the vehicle was surrounded recently (within this window) and is
+    # now moving along the egress direction, flag it even though nobody is
+    # actively "approaching" it any more — covers the case where the people
+    # who converged on it got in (as a driver/passenger/hostage) rather than
+    # staying visible outside, which would otherwise never re-qualify under
+    # the plain convergence gate above. Deliberately scored high on its own
+    # (not just a small bonus): a vehicle driven off shortly after being
+    # surrounded is a strong, largely self-explaining signal regardless of
+    # whether the weapon/struggle detectors also caught something.
+    convergence_recent_window_s: float = 20.0
+    convergence_recent_fleeing_score: float = 0.85
 
     # scoring / event debounce
     risk_score_flag_threshold: float = 0.65
@@ -103,19 +120,40 @@ def score_sprint(record: FrameFeatureVector, t: RuleThresholds) -> float:
     )
 
 
-def score_convergence(conv: VehicleConvergenceFeatureVector, t: RuleThresholds) -> float:
-    if conv.num_simultaneous_approachers < t.convergence_min_approachers:
-        return 0.0
-    if conv.angular_spread_deg < t.convergence_angle_threshold_deg:
-        return 0.0
-    remaining = max(1.0, 180.0 - t.convergence_angle_threshold_deg)
-    return max(0.5, _soft(conv.angular_spread_deg, t.convergence_angle_threshold_deg, remaining))
+def score_convergence(
+    conv: VehicleConvergenceFeatureVector,
+    t: RuleThresholds,
+    recently_surrounded: bool = False,
+) -> float:
+    fleeing = (
+        conv.vehicle_egress_speed_px_s is not None
+        and conv.vehicle_egress_speed_px_s >= t.convergence_egress_speed_px_s_threshold
+    )
+    qualifies_now = (
+        conv.num_simultaneous_approachers >= t.convergence_min_approachers
+        and conv.angular_spread_deg >= t.convergence_angle_threshold_deg
+    )
+
+    if qualifies_now:
+        remaining = max(1.0, 180.0 - t.convergence_angle_threshold_deg)
+        base = max(0.5, _soft(conv.angular_spread_deg, t.convergence_angle_threshold_deg, remaining))
+        bonus = t.convergence_fleeing_bonus if fleeing else 0.0
+        return min(1.0, base + bonus)
+
+    if recently_surrounded and fleeing:
+        # Nobody's actively converging on the vehicle this frame — they may
+        # have gotten in — but it was surrounded a moment ago and is now
+        # driving off along the egress path. Flag it on that basis alone.
+        return t.convergence_recent_fleeing_score
+
+    return 0.0
 
 
 class RuleBasedScorer(RiskScorer):
     def __init__(self, thresholds: RuleThresholds | None = None):
         self._t = thresholds or RuleThresholds()
         self._events = EventAggregator()
+        self._last_qualifying_convergence: dict[int, float] = {}
 
     def process_frame(
         self,
@@ -191,7 +229,18 @@ class RuleBasedScorer(RiskScorer):
                 flagged.append(event)
 
         for conv in convergence_records:
-            score = score_convergence(conv, t)
+            qualifies_now = (
+                conv.num_simultaneous_approachers >= t.convergence_min_approachers
+                and conv.angular_spread_deg >= t.convergence_angle_threshold_deg
+            )
+            if qualifies_now:
+                self._last_qualifying_convergence[conv.vehicle_track_id] = timestamp_s
+            last_qualifying_ts = self._last_qualifying_convergence.get(conv.vehicle_track_id)
+            recently_surrounded = (
+                last_qualifying_ts is not None
+                and timestamp_s - last_qualifying_ts <= t.convergence_recent_window_s
+            )
+            score = score_convergence(conv, t, recently_surrounded)
             event = self._events.update(
                 "multi_directional_convergence",
                 (conv.vehicle_track_id,),

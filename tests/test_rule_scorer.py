@@ -4,6 +4,7 @@ from driveway_guard.features.schema import (
     VehicleConvergenceFeatureVector,
 )
 from driveway_guard.scoring.rules import (
+    RuleBasedScorer,
     RuleThresholds,
     score_boxing_in,
     score_convergence,
@@ -174,3 +175,86 @@ def test_convergence_positive_when_wide_spread_multiple_people():
     t = RuleThresholds()
     conv = _make_convergence(angular_spread_deg=180.0, num_simultaneous_approachers=2)
     assert score_convergence(conv, t) > 0.0
+
+
+def test_convergence_boosted_when_vehicle_fleeing_along_egress():
+    t = RuleThresholds()
+    stationary = _make_convergence(angular_spread_deg=100.0)
+    fleeing = _make_convergence(
+        angular_spread_deg=100.0,
+        vehicle_egress_speed_px_s=t.convergence_egress_speed_px_s_threshold * 2,
+    )
+    assert score_convergence(fleeing, t) > score_convergence(stationary, t)
+
+
+def test_convergence_no_fleeing_bonus_without_calibration():
+    t = RuleThresholds()
+    conv = _make_convergence(angular_spread_deg=100.0)
+    assert conv.vehicle_egress_speed_px_s is None
+    assert score_convergence(conv, t) == 0.5
+
+
+def test_convergence_recently_surrounded_and_fleeing_scores_without_current_approachers():
+    # Nobody's actively converging this frame (e.g. they got in the car),
+    # but the vehicle was surrounded a moment ago and is now driving off.
+    t = RuleThresholds()
+    conv = _make_convergence(
+        num_simultaneous_approachers=0,
+        approaching_person_track_ids=[],
+        approaching_person_bearings_deg=[],
+        angular_spread_deg=0.0,
+        vehicle_egress_speed_px_s=t.convergence_egress_speed_px_s_threshold * 2,
+    )
+    assert score_convergence(conv, t, recently_surrounded=True) == t.convergence_recent_fleeing_score
+
+
+def test_convergence_zero_when_fleeing_but_not_recently_surrounded():
+    t = RuleThresholds()
+    conv = _make_convergence(
+        num_simultaneous_approachers=0,
+        approaching_person_track_ids=[],
+        approaching_person_bearings_deg=[],
+        angular_spread_deg=0.0,
+        vehicle_egress_speed_px_s=t.convergence_egress_speed_px_s_threshold * 2,
+    )
+    assert score_convergence(conv, t, recently_surrounded=False) == 0.0
+
+
+def test_scorer_flags_vehicle_driven_off_shortly_after_being_surrounded():
+    """End-to-end regression for the "hijackers get in and reverse the car,
+    driver possibly still inside" scenario: the convergence signal itself
+    disappears once nobody is left "approaching" (they've gotten in), so
+    this needs the scorer's cross-frame memory, not just a single-frame
+    score, to still flag the vehicle once it drives off."""
+    t = RuleThresholds()
+    scorer = RuleBasedScorer(t)
+
+    surrounded = _make_convergence(
+        vehicle_track_id=1, angular_spread_deg=180.0, num_simultaneous_approachers=2
+    )
+    assert scorer.process_frame(0, 0.0, [], [], [surrounded]) == []
+
+    # Everyone's gotten in — no approachers, vehicle not moving yet.
+    got_in = _make_convergence(
+        vehicle_track_id=1,
+        approaching_person_track_ids=[],
+        approaching_person_bearings_deg=[],
+        angular_spread_deg=0.0,
+        num_simultaneous_approachers=0,
+    )
+    assert scorer.process_frame(1, 0.5, [], [], [got_in]) == []
+
+    # Now it's moving off along the egress path — two consecutive samples
+    # needed past event_min_duration_s before it actually flags.
+    fleeing = _make_convergence(
+        vehicle_track_id=1,
+        approaching_person_track_ids=[],
+        approaching_person_bearings_deg=[],
+        angular_spread_deg=0.0,
+        num_simultaneous_approachers=0,
+        vehicle_egress_speed_px_s=t.convergence_egress_speed_px_s_threshold * 2,
+    )
+    assert scorer.process_frame(2, 1.0, [], [], [fleeing]) == []
+    events = scorer.process_frame(3, 1.5, [], [], [fleeing])
+    assert len(events) == 1
+    assert events[0].event_type == "multi_directional_convergence"

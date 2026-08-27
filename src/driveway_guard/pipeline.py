@@ -78,7 +78,12 @@ class Pipeline:
         blocking_observations = self._feature_extractor.extract_blocking(
             frame_idx, timestamp_s, vehicles, persons, self._calibration
         )
-        convergence_records = compute_convergence(frame_idx, timestamp_s, pair_records)
+        vehicle_velocities = {
+            v.track_id: self._feature_extractor.vehicle_velocity_px_s(v.track_id) for v in vehicles
+        }
+        convergence_records = compute_convergence(
+            frame_idx, timestamp_s, pair_records, vehicles, vehicle_velocities, self._calibration
+        )
 
         banner: list[str] = []
         if self._scorer is not None:

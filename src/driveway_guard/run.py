@@ -120,6 +120,21 @@ def main() -> None:
 
     write_json(pipeline.events, config.out_dir / "events.json")
     write_csv(pipeline.events, config.out_dir / "events.csv")
+
+    if pipeline.events:
+        logger.info("Flagged events (sorted by time):")
+        for event in sorted(pipeline.events, key=lambda e: e.start_timestamp_s):
+            logger.info(
+                "  [%s] t=%.2fs-%.2fs  score=%.2f  track_ids=%s",
+                event.event_type,
+                event.start_timestamp_s,
+                event.end_timestamp_s,
+                event.peak_score,
+                event.track_ids,
+            )
+    else:
+        logger.info("No events flagged.")
+
     (config.out_dir / "run_meta.json").write_text(
         json.dumps(
             {

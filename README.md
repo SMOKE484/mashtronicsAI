@@ -7,7 +7,10 @@ flags candidate hijacking/carjacking events for human review:
 - a second vehicle "boxing in" the resident's car (blocking the egress path)
 - a weapon visible at a vehicle window
 - a sprint approach toward a stationary vehicle
-- multi-directional convergence (2+ people closing in from different angles)
+- multi-directional convergence (2+ people closing in from different angles),
+  boosted when the vehicle is also moving in the egress direction (i.e.
+  driving/backing out of the driveway while surrounded — a resident
+  attempting to flee under duress, requires calibration)
 
 v1 is offline (processes video files, not live streams yet) and scores risk
 with hand-written rules over detection/tracking/pose features rather than a

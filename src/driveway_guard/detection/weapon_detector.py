@@ -6,6 +6,14 @@ from ultralytics import YOLO
 from driveway_guard.detection.types import TrackedObject
 from driveway_guard.imaging import crop_with_padding
 
+# Class names that some weapon-dataset exports include as non-threat/negative
+# classes (the person being cropped around, or common false-positive-prone
+# handheld objects the dataset was trained to distinguish from a weapon).
+# Never let one of these win the per-crop argmax. Matched case-insensitively
+# against the checkpoint's own class names, so any additional real threat
+# classes (pistol, rifle, knife, ...) keep working with no code change.
+_NON_THREAT_CLASS_NAMES = {"person", "hand", "phone"}
+
 
 class WeaponDetector:
     """Proximity-gated firearm detection near a vehicle window/door.
@@ -26,12 +34,16 @@ class WeaponDetector:
         conf: float = 0.4,
         proximity_norm: float = 0.15,
         pad_ratio: float = 0.4,
+        non_threat_class_names: set[str] | None = None,
     ):
         self._model = YOLO(model_path)
         self._device = device
         self._conf = conf
         self._proximity_norm = proximity_norm
         self._pad_ratio = pad_ratio
+        self._non_threat_class_names = {
+            name.lower() for name in (non_threat_class_names or _NON_THREAT_CLASS_NAMES)
+        }
 
     def gated_person_ids(
         self,
@@ -74,9 +86,18 @@ class WeaponDetector:
             if boxes is None or len(boxes) == 0:
                 continue
             confs = boxes.conf.cpu().numpy()
+            cls_ids = boxes.cls.cpu().numpy().astype(int)
+            names = self._model.names
+            threat_mask = np.array(
+                [names.get(c, "").lower() not in self._non_threat_class_names for c in cls_ids]
+            )
+            if not threat_mask.any():
+                continue
+            confs = confs[threat_mask]
+            xyxy = boxes.xyxy.cpu().numpy()[threat_mask]
             best_idx = int(confs.argmax())
             best_conf = float(confs[best_idx])
-            x1, y1, x2, y2 = boxes.xyxy.cpu().numpy()[best_idx]
+            x1, y1, x2, y2 = xyxy[best_idx]
             results[p.track_id] = (
                 best_conf,
                 (float(x1 + offset_x), float(y1 + offset_y), float(x2 + offset_x), float(y2 + offset_y)),

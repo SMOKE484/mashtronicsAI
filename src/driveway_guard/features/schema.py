@@ -72,6 +72,13 @@ class VehicleConvergenceFeatureVector:
     angular_spread_deg: float
     num_simultaneous_approachers: int
 
+    # vehicle egress motion while surrounded — a resident trying to flee by
+    # driving/backing out of the driveway while people are converging on the
+    # car is a materially higher-risk situation than a stationary convergence.
+    # None if no calibration (no egress_path to project onto) is available.
+    vehicle_velocity_px_s: Point = (0.0, 0.0)
+    vehicle_egress_speed_px_s: float | None = None
+
 
 @dataclass(slots=True)
 class BlockingObservation:
