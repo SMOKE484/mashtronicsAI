@@ -48,13 +48,14 @@ def main() -> None:
     source = VideoFileSource(args.video, frame_stride=args.frame_stride)
     logger.info(
         "resolution: %dx%d | fps: %.3f | frame_count: %d | scoring uses "
-        "weapon_confidence_threshold=%.2f, weapon_min_duration_s=%.2f",
+        "weapon_confidence_threshold=%.2f, weapon_min_duration_s=%.2f, weapon_max_gap_s=%.2f",
         source.frame_width,
         source.frame_height,
         source.fps,
         source.frame_count,
         thresholds.weapon_confidence_threshold,
         thresholds.weapon_min_duration_s,
+        thresholds.weapon_max_gap_s,
     )
 
     tracker = Tracker(args.detector_model, conf=args.tracker_conf, device=args.device)
@@ -95,7 +96,7 @@ def main() -> None:
         prev_ts = above_threshold[0][1]
         for _frame_idx, ts, _pid, _conf in above_threshold[1:]:
             gap_s = ts - prev_ts
-            if gap_s > 5.0 / max(source.fps, 1.0):
+            if gap_s > thresholds.weapon_max_gap_s:
                 longest_run_s = max(longest_run_s, prev_ts - run_start_ts)
                 run_start_ts = ts
             prev_ts = ts

@@ -13,6 +13,7 @@ class WeaponThresholds:
     weapon_confidence_threshold: float = 0.5
     weapon_min_duration_s: float = 0.5
     event_cooldown_s: float = 5.0
+    weapon_max_gap_s: float = 0.15
 
 
 def score_weapon_hit(confidence: float | None, threshold: float) -> float:
@@ -95,6 +96,7 @@ class WeaponScorer:
                 frame_idx,
                 timestamp_s,
                 [vehicle.track_id, *contributing_person_ids],
+                self._t.weapon_max_gap_s,
             )
             if event:
                 flagged.append(event)

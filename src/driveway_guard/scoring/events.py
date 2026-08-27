@@ -22,6 +22,7 @@ class _EventState:
     consecutive_samples: int = 0
     start_frame_idx: int = 0
     start_timestamp_s: float = 0.0
+    last_above_timestamp_s: float = 0.0
     peak_score: float = 0.0
     emitted: bool = False
     cooldown_until: float = -1.0
@@ -32,7 +33,14 @@ class EventAggregator:
     at/above threshold for at least `min_duration_s` (and at least two
     samples, to avoid a single-frame timestamp jump satisfying the duration
     check) before emitting a FlaggedEvent, then enforces a cooldown before
-    the same key can flag again."""
+    the same key can flag again.
+
+    `max_gap_s` tolerates brief below-threshold dips inside an otherwise
+    sustained detection without resetting the streak -- real per-frame
+    confidence is noisy, and requiring literally every sample to clear
+    threshold made a genuine ~1s detection with one dipped frame count as
+    two separate sub-threshold runs (see HANDOVER.md's real-footage
+    validation notes). A gap longer than max_gap_s still resets normally."""
 
     def __init__(self):
         self._states: dict[tuple, _EventState] = {}
@@ -48,14 +56,17 @@ class EventAggregator:
         frame_idx: int,
         timestamp_s: float,
         track_ids: list[int],
+        max_gap_s: float = 0.0,
     ) -> FlaggedEvent | None:
         state_key = (event_type, key)
         state = self._states.get(state_key)
 
         if score < threshold:
-            if state is not None:
-                state.consecutive_samples = 0
-                state.emitted = False
+            if state is not None and state.consecutive_samples > 0:
+                gap = timestamp_s - state.last_above_timestamp_s
+                if gap > max_gap_s:
+                    state.consecutive_samples = 0
+                    state.emitted = False
             return None
 
         if state is None:
@@ -69,6 +80,7 @@ class EventAggregator:
         else:
             state.peak_score = max(state.peak_score, score)
         state.consecutive_samples += 1
+        state.last_above_timestamp_s = timestamp_s
 
         duration = timestamp_s - state.start_timestamp_s
         ready = (

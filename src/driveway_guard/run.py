@@ -36,6 +36,12 @@ def parse_args() -> RunConfig:
     parser.add_argument("--weapon-confidence-threshold", type=float, default=0.5)
     parser.add_argument("--weapon-min-duration-s", type=float, default=0.5)
     parser.add_argument("--event-cooldown-s", type=float, default=5.0)
+    parser.add_argument(
+        "--weapon-max-gap-s",
+        type=float,
+        default=0.15,
+        help="Tolerate a below-threshold dip up to this long without resetting the duration debounce",
+    )
     args = parser.parse_args()
 
     return RunConfig(
@@ -54,6 +60,7 @@ def parse_args() -> RunConfig:
         weapon_confidence_threshold=args.weapon_confidence_threshold,
         weapon_min_duration_s=args.weapon_min_duration_s,
         event_cooldown_s=args.event_cooldown_s,
+        weapon_max_gap_s=args.weapon_max_gap_s,
     )
 
 
@@ -86,6 +93,7 @@ def main() -> None:
         weapon_confidence_threshold=config.weapon_confidence_threshold,
         weapon_min_duration_s=config.weapon_min_duration_s,
         event_cooldown_s=config.event_cooldown_s,
+        weapon_max_gap_s=config.weapon_max_gap_s,
     )
     scorer = WeaponScorer(thresholds)
 
@@ -145,6 +153,7 @@ def main() -> None:
                 "weapon_confidence_threshold": config.weapon_confidence_threshold,
                 "weapon_min_duration_s": config.weapon_min_duration_s,
                 "event_cooldown_s": config.event_cooldown_s,
+                "weapon_max_gap_s": config.weapon_max_gap_s,
                 "num_events": len(pipeline.events),
             },
             indent=2,

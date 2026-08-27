@@ -25,3 +25,4 @@ class RunConfig:
     weapon_confidence_threshold: float = 0.5
     weapon_min_duration_s: float = 0.5
     event_cooldown_s: float = 5.0
+    weapon_max_gap_s: float = 0.15
