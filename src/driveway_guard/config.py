@@ -23,6 +23,6 @@ class RunConfig:
     # "Validation against real footage" -- weapon_min_duration_s in
     # particular is expected to need tuning against real clips.
     weapon_confidence_threshold: float = 0.5
-    weapon_min_duration_s: float = 0.5
+    weapon_min_duration_s: float = 0.15
     event_cooldown_s: float = 5.0
     weapon_max_gap_s: float = 0.15

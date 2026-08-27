@@ -121,8 +121,9 @@ has the full JSON config shape.
 
 Weapon-at-window detection: tracker (YOLO11 + ByteTrack) → proximity-gated
 weapon detector → duration-debounced event, keyed per-vehicle (survives
-person-track-ID churn — see `HANDOVER.md`/plan for why). Not yet re-validated
-against real footage since the rewrite (see `HANDOVER.md` "Validation against
-real footage" for the exact next steps). Struggle / boxing-in / sprint /
-convergence are designed, previously implemented, and retired pending their
+person-track-ID churn — see `HANDOVER.md`/plan for why). **Validated against
+real footage** (2026-08-27): fires correctly on `video1.mp4`/`video3.mp4`,
+zero false positives on `Normal.mp4` — see `HANDOVER.md` "Validation against
+real footage — outcome" for the tuned settings. Struggle / boxing-in / sprint
+/ convergence are designed, previously implemented, and retired pending their
 own turn in this incremental rebuild.

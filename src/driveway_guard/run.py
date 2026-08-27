@@ -34,7 +34,7 @@ def parse_args() -> RunConfig:
     parser.add_argument("--weapon-proximity-norm", type=float, default=0.15)
     parser.add_argument("--weapon-pad-ratio", type=float, default=0.4)
     parser.add_argument("--weapon-confidence-threshold", type=float, default=0.5)
-    parser.add_argument("--weapon-min-duration-s", type=float, default=0.5)
+    parser.add_argument("--weapon-min-duration-s", type=float, default=0.15)
     parser.add_argument("--event-cooldown-s", type=float, default=5.0)
     parser.add_argument(
         "--weapon-max-gap-s",

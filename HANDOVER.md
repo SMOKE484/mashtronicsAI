@@ -21,15 +21,16 @@ reproduced here, but nothing is lost: everything retired is still committed
 on `main` through commit `d647e3f`, pushed to GitHub, recoverable at any time
 via `git log` / `git show d647e3f:<path>`.
 
-**tl;dr of where things stand right now**: the code rewrite (Part 2, below)
-is done locally and passing 9/9 tests, but **not yet committed** — waiting on
-the user before committing. The dataset-expansion-and-retrain work (Part 1,
-below) is designed and the merge script is written, but **has not been run
-yet** — no new checkpoint exists. **Nothing has been validated against real
-footage since the rewrite.** The single most important next action is
-running Part 1 and Part 2's validation step on Kaggle, starting completely
-fresh there too (new notebook, fresh clone, fresh dataset downloads — not
-continuing from any prior Kaggle session's state).
+**tl;dr of where things stand right now (updated 2026-08-27)**: Parts 1 and 2
+are both done, committed, and pushed. **`weapon_at_window` has now fired
+correctly on both `video1.mp4` and `video3.mp4`, with zero false positives on
+`Normal.mp4`** — the first real end-to-end confirmation of a correctly-firing
+event on real footage for the whole project. See "Validation against real
+footage — outcome" below for the exact settings and results. Next up: decide
+whether to keep iterating on the weapon checkpoint (its merged-dataset
+validation metrics are still below the original baseline, even though it
+passes real-footage validation — see Part 1) or move on to bringing back the
+next event type (struggle).
 
 ## What this project is
 
@@ -53,7 +54,7 @@ their code is currently retired (see "What's retired" below) pending this
 incremental rebuild. They come back one at a time, using the retired code in
 git history as a starting point rather than being redesigned from zero.
 
-## Part 1: expand the weapon dataset and retrain — designed, not yet run
+## Part 1: expand the weapon dataset and retrain — done, checkpoint in use
 
 The existing `weapon_model.pt` (if you still have it downloaded locally —
 otherwise it needs retraining regardless, see "Kaggle workflow" below on why
@@ -78,33 +79,47 @@ sample thumbnails, not just page descriptions or search-result summaries:
 | `augustus/guns_dataset_kaggle_cctv` | 3,356 | `guns` | CC BY 4.0 | Rejected — sampled thumbnail was a stock "pistol vs. revolver" product photo, not CCTV footage, despite the "kaggle_cctv" name. |
 | `simuletic/cctv-weapon-detection-dataset-vcloz` | 141 | `person-weapon` | — | Rejected — too small, and the merged class name is the same red flag pattern as previously-rejected noisy-label datasets. |
 
-**New script**: `scripts/merge_yolo_datasets.py` (written, not yet run).
-Combines two-or-more Roboflow YOLO exports into one, remapping each source's
-own class names onto a unified target list via a JSON config (full shape in
-the script's own docstring). Output is a normal-shaped YOLO export
-(`train/valid[/test]` images+labels, `data.yaml`), so
-`scripts/train_weapon_model.py` consumes it with **zero changes** via
-`--data <merged>/data.yaml`.
+**`scripts/merge_yolo_datasets.py`**: combines two-or-more Roboflow YOLO
+exports into one, remapping each source's own class names onto a unified
+target list via a JSON config (full shape in the script's own docstring).
+Output is a normal-shaped YOLO export (`train/valid[/test]` images+labels,
+`data.yaml`), so `scripts/train_weapon_model.py` consumes it with **zero
+changes** via `--data <merged>/data.yaml`. Supports a `null` class_map value
+to drop a source class's boxes entirely (added this session — see below).
 
-**Not yet done, in order**:
-1. Download both datasets fresh on Kaggle (a **fresh notebook** — see
-   "Kaggle workflow" below, don't assume anything from a prior Kaggle session
-   is still there).
-2. Run `scripts/merge_yolo_datasets.py` to combine them.
-3. Run `scripts/train_weapon_model.py --data <merged>/data.yaml --out ...
-   --device cuda:0` (same script, same flags as before — see README.md
-   "Weapon detection model" for the exact command shape).
-4. Compare the new `metrics.json` against the baseline above — only adopt
-   the new checkpoint if it's actually better, don't swap blind.
-5. **Save `weapon_model.pt` as a proper Kaggle Dataset immediately** —
-   `/kaggle/working` does not survive across separate Kaggle sessions, only
-   within one continuous session/disk. This has already cost one checkpoint
-   once before.
-6. If the Roboflow API key you use was the one exposed in a screenshot in an
-   earlier session, rotate it first (still unconfirmed whether that was ever
-   done).
+**What actually ran, and what was learned**:
+1. `dietest/gun-cctv-detection`'s real class list turned out to be
+   `['Handgun', 'Knife', 'Short_rifle']` (`nc=3`), not the single `Guns`
+   class the original research assumed — the dataset page's advertised class
+   list didn't match the actual exported `data.yaml`, same lesson as the
+   "verify, don't trust the description" pattern that rejected other
+   candidates.
+2. First attempt mapped all three classes onto `weapon`. Result was **worse
+   than baseline on every metric** (`weapon`: precision 0.728/recall
+   0.553/mAP50 0.629 vs. baseline 0.833/0.652/0.744) — folding knives and
+   rifles into one label with handguns diluted the class.
+3. Second attempt dropped `Knife`/`Short_rifle` (mapped to `null`, i.e.
+   excluded from training as a class, image kept as a background example)
+   and kept only `Handgun → weapon`. Slightly better but still below
+   baseline (`weapon`: 0.728→0.768 precision, recall still ~0.55).
+4. **User explicitly wants any gun type covered, not just handguns** — final
+   config keeps `Handgun → weapon` and `Short_rifle → weapon`, only
+   `Knife → null` (dropped). Metrics: `person` 0.835/0.806/0.852, `weapon`
+   0.768/0.555/0.646 (precision/recall/mAP50) — still below the original
+   baseline in aggregate, particularly weapon recall (0.555 vs. 0.652).
+5. **Despite the weaker aggregate validation metrics, this checkpoint passed
+   real-footage validation** (see below) — the merged-dataset validation
+   split isn't apples-to-apples with the original single-dataset baseline
+   (different image pool), so don't over-index on that comparison alone.
+   This checkpoint is the one currently in use.
+6. The Roboflow API key in use is the same one flagged in an earlier session
+   as possibly exposed in a shared screenshot. **User explicitly decided to
+   keep using it rather than rotate** (2026-08-27) — a conscious call, not an
+   oversight; revisit only if the user's stance changes. A local untracked
+   `credentials.txt` in the repo root still has this key in plaintext — never
+   add it to git.
 
-## Part 2: rebuild the pipeline code — done locally, not committed, not validated
+## Part 2: rebuild the pipeline code — done, committed, validated on real footage
 
 ### What's reused as-is (unchanged from before)
 
@@ -146,16 +161,22 @@ script).
 place but **currently broken** — they import the retired modules
 (`FeatureExtractor`, `PoseEstimator`, `compute_convergence`,
 `CalibrationConfig`) and will fail at import time until those come back.
-`scripts/inspect_weapon_hits.py`, `scripts/export_weapon_snapshots.py`, and
-`scripts/train_weapon_model.py` are untouched and still work.
+`scripts/export_weapon_snapshots.py` and `scripts/train_weapon_model.py` are
+untouched and still work. `scripts/inspect_weapon_hits.py` was **not**
+actually working despite an earlier version of this file claiming so — it
+still imported the retired `RuleThresholds` from `scoring.rules`. Fixed this
+session to import `WeaponThresholds` from `scoring.weapon` instead; also
+updated its longest-continuous-run calculation to use
+`thresholds.weapon_max_gap_s` (see below) instead of a hardcoded 5-frame gap,
+so its diagnostic output matches what the real pipeline would actually do.
 
 ### New: weapon-only pipeline
 
 **`src/driveway_guard/scoring/weapon.py`** (new):
 - `WeaponThresholds`: `weapon_confidence_threshold=0.5`,
-  `weapon_min_duration_s=0.5`, `event_cooldown_s=5.0` — same numeric
-  defaults as the old code's *intent*, but see the threshold-behavior note
-  below, it's not a pure port.
+  `weapon_min_duration_s=0.15` (tuned down from an initial 0.5 default — see
+  "Validation against real footage — outcome" below), `event_cooldown_s=5.0`,
+  `weapon_max_gap_s=0.15` (added this session, see below).
 - `score_weapon_hit(confidence, threshold)` — `0.0` below threshold or
   `None`, else passthrough confidence.
 - `WeaponScorer` — wraps one `EventAggregator`. **Keyed by vehicle track ID
@@ -178,20 +199,30 @@ So real events effectively needed confidence ≥0.65, not ≥0.5, even though
 0.5 was the "documented" weapon threshold. The new `WeaponScorer` collapses
 this to one clear threshold (0.5 default, fully configurable via
 `--weapon-confidence-threshold`). This is a deliberate simplification, not
-an accidental regression — but it does mean the new pipeline will pass more
-lower-confidence hits through to the duration debounce than the old one did.
-Worth watching for in the real-footage validation below.
+an accidental regression.
+
+**Second, more impactful bug found during real-footage validation**:
+`EventAggregator.update()` reset its duration streak to zero on **any single
+below-threshold sample**, no tolerance at all. Real per-frame confidence is
+noisy — a genuine ~1s detection with one frame that dipped below threshold
+counted as two separate sub-threshold runs, neither long enough to fire.
+Fixed by adding `weapon_max_gap_s` (default 0.15s): a below-threshold sample
+no longer resets the streak unless the elapsed time since the last
+above-threshold sample exceeds this gap. This is generic to `EventAggregator`
+itself (shared code, not weapon-specific) via a new optional `max_gap_s` param
+on `update()`, defaulting to `0.0` (old strict behavior) for any caller that
+doesn't pass it.
 
 **`pipeline.py`, `config.py`, `run.py`** — rewritten, same filenames. CLI
 shape: `python -m driveway_guard.run --video <path> --out <dir>
 --weapon-model <path> [--detector-model yolo11n.pt] [--conf 0.35]
 [--device cpu] [--frame-stride 1] [--no-video-output] [--log-level INFO]
 [--weapon-conf 0.4] [--weapon-proximity-norm 0.15] [--weapon-pad-ratio 0.4]
-[--weapon-confidence-threshold 0.5] [--weapon-min-duration-s 0.5]
-[--event-cooldown-s 5.0]`. `--weapon-model` is now **required** — no more
-"skip the stage if omitted," since weapon detection is the entire point of
-this phase. No `--calib`, no `--pose-model` (those flags are gone, not just
-defaulted).
+[--weapon-confidence-threshold 0.5] [--weapon-min-duration-s 0.15]
+[--event-cooldown-s 5.0] [--weapon-max-gap-s 0.15]`. `--weapon-model` is now
+**required** — no more "skip the stage if omitted," since weapon detection is
+the entire point of this phase. No `--calib`, no `--pose-model` (those flags
+are gone, not just defaulted).
 
 ### New tests
 
@@ -203,39 +234,54 @@ defaulted).
   a proximity-gating test (far person never even reaches the model).
 - `tests/test_weapon_scorer.py` — `score_weapon_hit` pure-function cases,
   a duration-debounce integration test, a "never clears confidence
-  threshold" negative test, and the vehicle-only-keying regression test
-  described above.
+  threshold" negative test, the vehicle-only-keying regression test
+  described above, and two gap-tolerance tests (a brief dip within
+  `weapon_max_gap_s` must not reset; a gap longer than it still must).
 
-**9/9 tests passing** (`.venv/Scripts/python.exe -m pytest -q`).
+**11/11 tests passing** (`.venv/Scripts/python.exe -m pytest -q`).
 
-## Validation against real footage — not yet done, highest-priority next step
+## Validation against real footage — outcome (2026-08-27)
 
-Using the Kaggle workflow below, **starting completely fresh** (new
-notebook — the user was explicit this session that even Kaggle should start
-from the bottom, not continue from any prior session's leftover state):
+Ran on Kaggle (fresh notebook, GPU T4) against the retrained checkpoint from
+Part 1 (`Handgun`+`Short_rifle → weapon`, `Knife` dropped).
 
-1. Get a `weapon_model.pt` — either finish Part 1 first (recommended, since
-   it should be a strictly better checkpoint), or use whatever checkpoint is
-   available locally/on Kaggle already if Part 1 hasn't been run yet. Parts 1
-   and 2 have no dependency on each other.
-2. Re-run the new `run.py` against `video1.mp4` and `video3.mp4` (the
-   `hijackings` dataset — real mount path via
-   `find /kaggle/input/ -iname "*.mp4"`, don't trust the sidebar's displayed
-   path) with `--weapon-model weapon_model.pt` at current defaults. Confirm
-   `weapon_at_window` fires on both — this would be the first real
-   end-to-end confirmation of a correctly-firing event on real footage for
-   the whole project.
-3. If it doesn't fire on `video1.mp4` (whose cleanest previous run was a
-   genuine 0.32s continuous detection, under the current 0.5s
-   `weapon_min_duration_s`), lower `--weapon-min-duration-s` (e.g. toward
-   0.3s) and re-run rather than guessing blind.
-4. Re-run against `Normal.mp4` (benign clip, `training1` dataset) and
-   confirm zero false-positive `weapon_at_window` events at whatever
-   settings get chosen in step 3.
-5. Update this handover with the outcome once confirmed working, so the next
-   phase (adding the next event type — likely struggle, pulling its retired
-   code back from `git show d647e3f:src/driveway_guard/...`) starts with an
-   accurate record.
+**First pass, at the then-defaults (`weapon_confidence_threshold=0.5`,
+`weapon_min_duration_s=0.5`)**: zero events on `video1.mp4`, `video3.mp4`,
+*and* `Normal.mp4`. Looked like a clean-but-useless pass at first (no false
+positives, but also no true positives). Diagnosed with
+`scripts/inspect_weapon_hits.py --conf 0.1` (after fixing its stale import,
+see above) run against the raw per-frame confidence: the model **was**
+detecting the weapon repeatedly, with strong confidence (up to 0.72 on
+video1, 0.77 on video3) — this was not a detection failure. The
+`EventAggregator` zero-tolerance reset bug (described above) was the actual
+cause: single-frame confidence dips broke every run into pieces under ~0.22s,
+never reaching the 0.5s duration requirement.
+
+**After the `weapon_max_gap_s` fix**, replaying the same logged confidence
+values locally showed the longest bridgeable run was still only ~0.15–0.22s
+(gap tolerance alone doesn't manufacture duration that isn't there) — so
+`weapon_min_duration_s` also needed to drop, to 0.15s. This is now the
+code's default in `WeaponThresholds`/`RunConfig`/`--weapon-min-duration-s`.
+
+**Final result at `weapon_confidence_threshold=0.5`, `weapon_min_duration_s=
+0.15`, `weapon_max_gap_s=0.15`**:
+- `video1.mp4`: 1 `weapon_at_window` event, t=10.35–10.57s, peak_score=0.716
+- `video3.mp4`: 1 `weapon_at_window` event, t=18.73–18.90s, peak_score=0.770
+- `Normal.mp4`: 0 events (no false positive at this tighter duration)
+
+This is the first confirmed correctly-firing event on real footage for the
+whole project. **Caveat worth remembering**: `weapon_min_duration_s=0.15` is
+a much more permissive debounce than the original 0.5s design intent — it
+was validated clean against exactly one benign clip (`Normal.mp4`). If
+false positives show up on other benign footage later, `weapon_confidence_
+threshold` (currently 0.5, and this checkpoint's precision is below
+baseline) is the more likely lever to raise before duration.
+
+**Next options, not yet decided**: keep iterating on the weapon checkpoint
+itself (still below baseline on aggregate validation metrics despite passing
+real-footage validation), or move on to bringing back the next event type
+(likely struggle, pulling its retired code back from
+`git show d647e3f:src/driveway_guard/...`).
 
 ## Explicitly out of scope right now
 
