@@ -21,16 +21,26 @@ reproduced here, but nothing is lost: everything retired is still committed
 on `main` through commit `d647e3f`, pushed to GitHub, recoverable at any time
 via `git log` / `git show d647e3f:<path>`.
 
-**tl;dr of where things stand right now (updated 2026-08-27)**: Parts 1 and 2
-are both done, committed, and pushed. **`weapon_at_window` has now fired
-correctly on both `video1.mp4` and `video3.mp4`, with zero false positives on
-`Normal.mp4`** — the first real end-to-end confirmation of a correctly-firing
-event on real footage for the whole project. See "Validation against real
-footage — outcome" below for the exact settings and results. Next up: decide
-whether to keep iterating on the weapon checkpoint (its merged-dataset
-validation metrics are still below the original baseline, even though it
-passes real-footage validation — see Part 1) or move on to bringing back the
-next event type (struggle).
+**tl;dr of where things stand right now (updated 2026-08-27, retracting part
+of the same day's earlier update)**: Parts 1 and 2 are both done, committed,
+and pushed. `weapon_at_window` fires on both `video1.mp4` and `video3.mp4`
+with zero false positives on `Normal.mp4` — but a visual spot-check of the
+actual detection boxes (via `scripts/export_weapon_snapshots.py`) found the
+retrained checkpoint is **partly keying off false detections, not the actual
+gun**: on `video1.mp4`, 2 of the 4 highest-confidence hits land on a car roof
+and a car side-mirror (no weapon present at all), including one hit that was
+*inside* the event window this handover previously called "confirmed
+working." The other 2 hits land on a real person but with an oversized box
+around their whole dark-clothed silhouette, not a resolved gun shape. **Do
+not treat the retrained checkpoint as validated** — the event-firing test
+alone (does `weapon_at_window` fire at the right time, stay quiet on
+`Normal.mp4`) was not sufficient; it can pass while detecting the wrong
+thing. See "Validation against real footage — outcome, then retracted"
+below for the full detail and exported images. **User's decision: the next
+session should investigate the retrain itself** (why the merged dataset
+teaches dark/reflective-surface false positives) rather than immediately
+reverting to baseline or just raising the confidence threshold — those
+remain fallback options if the investigation doesn't pan out.
 
 ## What this project is
 
@@ -240,7 +250,7 @@ are gone, not just defaulted).
 
 **11/11 tests passing** (`.venv/Scripts/python.exe -m pytest -q`).
 
-## Validation against real footage — outcome (2026-08-27)
+## Validation against real footage — outcome, then retracted (2026-08-27)
 
 Ran on Kaggle (fresh notebook, GPU T4) against the retrained checkpoint from
 Part 1 (`Handgun`+`Short_rifle → weapon`, `Knife` dropped).
@@ -269,19 +279,63 @@ code's default in `WeaponThresholds`/`RunConfig`/`--weapon-min-duration-s`.
 - `video3.mp4`: 1 `weapon_at_window` event, t=18.73–18.90s, peak_score=0.770
 - `Normal.mp4`: 0 events (no false positive at this tighter duration)
 
-This is the first confirmed correctly-firing event on real footage for the
-whole project. **Caveat worth remembering**: `weapon_min_duration_s=0.15` is
-a much more permissive debounce than the original 0.5s design intent — it
-was validated clean against exactly one benign clip (`Normal.mp4`). If
-false positives show up on other benign footage later, `weapon_confidence_
-threshold` (currently 0.5, and this checkpoint's precision is below
-baseline) is the more likely lever to raise before duration.
+At this point the handover (in an earlier revision, same day) called this
+"the first confirmed correctly-firing event on real footage for the whole
+project." **That conclusion was premature and is retracted below** — the
+event-firing test only checks *timing* (did an event fire when it should,
+stay quiet when it shouldn't), which turned out to not be sufficient.
 
-**Next options, not yet decided**: keep iterating on the weapon checkpoint
-itself (still below baseline on aggregate validation metrics despite passing
-real-footage validation), or move on to bringing back the next event type
-(likely struggle, pulling its retired code back from
-`git show d647e3f:src/driveway_guard/...`).
+### Visual spot-check (`scripts/export_weapon_snapshots.py`) — found real false positives
+
+Exporting and eyeballing the actual annotated detection boxes (not just the
+debounced event timestamps) on `video1.mp4`'s 4 highest-confidence hits
+(≥0.5 confidence, ≥0.3s apart) found:
+
+- `frame00421_t10.40s_conf0.72` — the "weapon" box is on **the black car's
+  roof**. No weapon present there. This frame falls *inside* the event
+  window (t=10.35–10.57s) that was just called "confirmed working."
+- `frame00464_t11.46s_conf0.67` — box on **the car's side mirror**. Also no
+  weapon.
+- `frame00218_t5.38s_conf0.57` and `frame00234_t5.78s_conf0.70` — box lands
+  on an actual person in dark clothing (plausibly the "second gunman" from
+  earlier sessions' notes), but oversized around their whole dark silhouette
+  rather than resolving a specific gun shape — consistent with the model
+  using "dark blob near a person" as a proxy signal rather than genuine
+  weapon-shape recognition.
+
+**Conclusion**: the retrained checkpoint (Part 1's final
+`Handgun`+`Short_rifle → weapon` merge) is at least partly keying off
+dark/reflective surfaces, not the actual weapon. The `video1.mp4` event that
+fired at t=10.35–10.57s is contaminated by at least one of these false
+detections — it is not established that a genuine weapon detection is what
+made it fire. This lines up with the checkpoint's weaker-than-baseline
+validation precision (0.768 vs. baseline 0.833) recorded in Part 1 — the
+aggregate metrics were already hinting at this, and the visual check
+confirmed it concretely. `video3.mp4`'s hits have not yet been visually
+spot-checked the same way (its snapshots were exported but not reviewed
+before this note was written) — do that first thing next session, same
+method, before assuming it's clean.
+
+**User's decision (2026-08-27): investigate the retrain itself next
+session**, in a separate chat — i.e. figure out *why* the merged dataset
+teaches this dark-surface shortcut (dataset composition? training epochs/
+hyperparameters? something about how `gun_cctv`'s images differ from
+`cctv_v3`'s?) rather than immediately falling back to either of the other
+two options that were on the table and remain available if the
+investigation stalls:
+- **Revert to the original pre-retrain checkpoint** (`person`/`weapon`,
+  precision 0.833/recall 0.652/mAP50 0.744) that the previous session called
+  "confirmed genuine detections" — but that claim was never itself
+  visually spot-checked with `export_weapon_snapshots.py` either, so don't
+  assume it's clean without doing the same check on it first.
+- **Raise `weapon_confidence_threshold`** (e.g. to 0.75–0.8) on the current
+  checkpoint and re-check whether a genuine gun detection survives on its
+  own once the car-roof/mirror hits (0.67–0.72) are filtered out.
+
+Either way: **do not adopt this checkpoint, and do not treat weapon
+detection as validated**, until a checkpoint's hits have been visually
+spot-checked and shown to actually be a weapon, not just shown to fire a
+debounced event at a plausible time.
 
 ## Explicitly out of scope right now
 
