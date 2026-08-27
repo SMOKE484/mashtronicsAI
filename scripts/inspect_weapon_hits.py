@@ -21,7 +21,7 @@ from pathlib import Path
 from driveway_guard.detection.tracker import Tracker
 from driveway_guard.detection.types import ObjectClass
 from driveway_guard.detection.weapon_detector import WeaponDetector
-from driveway_guard.scoring.rules import RuleThresholds
+from driveway_guard.scoring.weapon import WeaponThresholds
 from driveway_guard.sources.video_file import VideoFileSource
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level="INFO", format="%(message)s")
 
-    thresholds = RuleThresholds()
+    thresholds = WeaponThresholds()
     source = VideoFileSource(args.video, frame_stride=args.frame_stride)
     logger.info(
         "resolution: %dx%d | fps: %.3f | frame_count: %d | scoring uses "
