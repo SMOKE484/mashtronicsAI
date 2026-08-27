@@ -32,6 +32,15 @@ class FrameFeatureVector:
     vehicle_velocity_px_s: Point
     approach_speed_px_s: float
     dwell_time_s: float
+    # Separate from dwell_time_s above: dwell_time_s tracks time spent within
+    # the loose recording zone (record_proximity_norm, e.g. 0.5 — deliberately
+    # wide so approach/sprint/convergence signals are captured early). Struggle
+    # scoring needs "how long has this pair been continuously *close*"
+    # (RuleThresholds.proximity_norm_threshold, e.g. 0.08), which is a much
+    # tighter zone — using the loose dwell there let a person who merely
+    # lingered somewhere in the wide zone satisfy the dwell gate without ever
+    # being close enough, at the same time, to also satisfy the distance gate.
+    close_dwell_time_s: float
 
     # pose-derived (None if pose wasn't run / not gated this frame)
     pose_keypoints: list[Keypoint] | None = None

@@ -13,7 +13,7 @@ from driveway_guard.output.event_log import write_csv, write_json
 from driveway_guard.output.video_writer import AnnotatedVideoWriter
 from driveway_guard.pipeline import Pipeline
 from driveway_guard.pose.estimator import PoseEstimator
-from driveway_guard.scoring.rules import RuleBasedScorer
+from driveway_guard.scoring.rules import RuleBasedScorer, RuleThresholds
 from driveway_guard.sources.video_file import VideoFileSource
 
 
@@ -90,8 +90,9 @@ def main() -> None:
     else:
         logger.info("No --weapon-model provided; weapon-at-window detection is disabled.")
 
-    feature_extractor = FeatureExtractor()
-    scorer = RuleBasedScorer()
+    thresholds = RuleThresholds()
+    feature_extractor = FeatureExtractor(close_proximity_norm=thresholds.proximity_norm_threshold)
+    scorer = RuleBasedScorer(thresholds)
 
     video_writer = None
     if config.write_video:

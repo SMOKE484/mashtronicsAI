@@ -12,6 +12,13 @@ from driveway_guard.pose.estimator import Keypoint
 # Looser than the pose-gating threshold so approach/sprint/convergence
 # signals are captured before someone is already at the vehicle.
 _RECORD_PROXIMITY_NORM = 0.5
+# Must match RuleThresholds.proximity_norm_threshold in scoring/rules.py —
+# this is the "actually close" zone struggle scoring's dwell gate cares
+# about, distinct from the much looser _RECORD_PROXIMITY_NORM above.
+# run.py passes the live RuleThresholds value in explicitly so the two
+# can't drift apart silently; this is only a fallback for direct
+# construction (e.g. tests).
+_CLOSE_PROXIMITY_NORM = 0.08
 _CONTACT_NORM = 0.03
 _POSE_MIN_CONF = 0.3
 _BLOCKING_STOPPED_SPEED_PX_S = 15.0
@@ -25,10 +32,16 @@ _L_HIP, _R_HIP = 11, 12
 
 
 class FeatureExtractor:
-    def __init__(self, record_proximity_norm: float = _RECORD_PROXIMITY_NORM):
+    def __init__(
+        self,
+        record_proximity_norm: float = _RECORD_PROXIMITY_NORM,
+        close_proximity_norm: float = _CLOSE_PROXIMITY_NORM,
+    ):
         self._record_proximity_norm = record_proximity_norm
+        self._close_proximity_norm = close_proximity_norm
         self._histories: dict[int, TrackHistory] = {}
         self._pair_dwell = ProximityDwellTracker()
+        self._close_dwell = ProximityDwellTracker()
         self._blocking_dwell = ProximityDwellTracker()
 
     def _history(self, track_id: int) -> TrackHistory:
@@ -68,6 +81,7 @@ class FeatureExtractor:
                 dist_norm = dist_px / frame_diag if frame_diag > 0 else dist_px
                 if dist_norm > self._record_proximity_norm:
                     self._pair_dwell.update((p.track_id, v.track_id), False, timestamp_s)
+                    self._close_dwell.update((p.track_id, v.track_id), False, timestamp_s)
                     continue
 
                 p_hist = self._history(p.track_id)
@@ -76,6 +90,9 @@ class FeatureExtractor:
                 v_vel = v_hist.velocity_px_s()
                 approach_speed = _approach_speed(p.centroid, v.centroid, p_vel, v_vel)
                 dwell = self._pair_dwell.update((p.track_id, v.track_id), True, timestamp_s)
+                close_dwell = self._close_dwell.update(
+                    (p.track_id, v.track_id), dist_norm <= self._close_proximity_norm, timestamp_s
+                )
 
                 keypoints = poses.get(p.track_id)
                 pose_mean_conf = None
@@ -116,6 +133,7 @@ class FeatureExtractor:
                         vehicle_velocity_px_s=v_vel,
                         approach_speed_px_s=approach_speed,
                         dwell_time_s=dwell,
+                        close_dwell_time_s=close_dwell,
                         pose_keypoints=keypoints,
                         pose_mean_confidence=pose_mean_conf,
                         max_joint_velocity_px_s=max_joint_vel,

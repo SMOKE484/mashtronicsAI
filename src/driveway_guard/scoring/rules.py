@@ -70,7 +70,7 @@ def _soft(value: float, threshold: float, scale: float) -> float:
 def score_struggle(record: FrameFeatureVector, t: RuleThresholds) -> float:
     if record.person_vehicle_distance_norm > t.proximity_norm_threshold:
         return 0.0
-    if record.dwell_time_s < t.struggle_dwell_min_s:
+    if record.close_dwell_time_s < t.struggle_dwell_min_s:
         return 0.0
 
     joint_term = 0.0
@@ -86,7 +86,7 @@ def score_struggle(record: FrameFeatureVector, t: RuleThresholds) -> float:
         arms_term = _soft(record.arms_raised_score, t.arms_raised_score_threshold, 0.4)
 
     contact_term = 0.0
-    if record.person_person_contact and record.dwell_time_s >= t.contact_struggle_min_s:
+    if record.person_person_contact and record.close_dwell_time_s >= t.contact_struggle_min_s:
         contact_term = 1.0
 
     return min(1.0, 0.4 * joint_term + 0.3 * arms_term + 0.3 * contact_term)

@@ -139,3 +139,38 @@ def test_extract_pairs_dwell_time_accumulates_across_frames():
     r2 = extractor.extract_pairs(1, 2.0, 1000.0, [person], [vehicle], {}, None)[0]
     assert r1.dwell_time_s == 0.0
     assert abs(r2.dwell_time_s - 2.0) < 1e-6
+
+
+def test_close_dwell_time_does_not_accumulate_outside_close_zone():
+    """Person stays inside the loose recording zone the whole time (so
+    dwell_time_s accumulates normally) but never enters the much tighter
+    close-proximity zone struggle scoring cares about — close_dwell_time_s
+    must stay at 0 even while dwell_time_s climbs."""
+    extractor = FeatureExtractor(record_proximity_norm=0.5, close_proximity_norm=0.08)
+    person = TrackedObject(
+        track_id=1, cls=ObjectClass.PERSON, confidence=0.9, bbox_xyxy=(0, 0, 10, 10)
+    )
+    vehicle = TrackedObject(
+        track_id=2, cls=ObjectClass.VEHICLE, confidence=0.9, bbox_xyxy=(200, 5, 210, 15)
+    )
+    r1 = extractor.extract_pairs(0, 0.0, 1000.0, [person], [vehicle], {}, None)[0]
+    r2 = extractor.extract_pairs(1, 2.0, 1000.0, [person], [vehicle], {}, None)[0]
+    assert r2.person_vehicle_distance_norm > 0.08
+    assert r2.dwell_time_s > 0.0
+    assert r1.close_dwell_time_s == 0.0
+    assert r2.close_dwell_time_s == 0.0
+
+
+def test_close_dwell_time_accumulates_within_close_zone():
+    extractor = FeatureExtractor(record_proximity_norm=0.5, close_proximity_norm=0.08)
+    person = TrackedObject(
+        track_id=1, cls=ObjectClass.PERSON, confidence=0.9, bbox_xyxy=(0, 0, 10, 10)
+    )
+    vehicle = TrackedObject(
+        track_id=2, cls=ObjectClass.VEHICLE, confidence=0.9, bbox_xyxy=(5, 5, 15, 15)
+    )
+    r1 = extractor.extract_pairs(0, 0.0, 1000.0, [person], [vehicle], {}, None)[0]
+    r2 = extractor.extract_pairs(1, 2.0, 1000.0, [person], [vehicle], {}, None)[0]
+    assert r2.person_vehicle_distance_norm <= 0.08
+    assert r1.close_dwell_time_s == 0.0
+    assert abs(r2.close_dwell_time_s - 2.0) < 1e-6

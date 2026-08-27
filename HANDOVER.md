@@ -3,9 +3,26 @@
 Context for picking up this project in a new chat session, without the user
 re-explaining. Originally written 2026-08-26 at the end of the session that
 built v1; updated same day after a follow-up session that picked up weapon
-detection. Written to be detailed enough that a new session doesn't need to
-re-derive anything by re-reading code or re-running commands that already
-have known answers below.
+detection; updated again 2026-08-27 after a third session that: fixed a real
+bug in weapon detection, added and then fixed a new "vehicle flees after
+being surrounded" detection capability, designed (but did not yet build) a
+cross-event correlator, pushed everything to GitHub, and started a real-
+footage Kaggle testing round that is **currently blocked on an unexplained
+zero-events result** — see "Kaggle testing round 2" below, that's the most
+urgent thing to pick up. Written to be detailed enough that a new session
+doesn't need to re-derive anything by re-reading code or re-running commands
+that already have known answers below.
+
+**tl;dr of where things stand right now**: code is committed and pushed
+(`main` at `7f0477f`), 47/47 unit tests pass, but the pipeline has never
+been confirmed to actually produce a correct flagged event on real footage.
+Today's test batch (5 real sourced CCTV clips of hijackings + the earlier
+`Normal.mp4`) produced **0 events on all 6 clips**, including ones known to
+show an actual hijacking. A diagnostic already confirmed the detector *is*
+seeing people/vehicles in the footage (not a total failure), but the deeper
+diagnostic that would explain *why scoring never crosses threshold* was
+handed to the user and the session ended before it was run. That's the
+single highest-priority next action.
 
 ## What this project is
 
@@ -163,6 +180,96 @@ brainstorm:
   user tests on **Kaggle notebooks** (free T4 GPU) instead of running
   inference locally, because local free RAM is tight (see below).
 
+## Real-world hijacking chronology (reference material, sourced this session)
+
+The user shared a detailed real-world tactical breakdown of South African
+driveway hijackings, sourced from the National Hijack Prevention Academy
+(NHPA) and SAPS data (>70% of carjackings happen at/near home driveways).
+This directly grounded two design decisions this session (the convergence
+fleeing-signal fix, and the correlator design below) and should keep
+informing threshold tuning once real footage is available. Five stages,
+strict timeline, **whole event typically under 30-45 seconds start to
+finish**:
+
+1. **Tailgate / driveway stakeout** — attackers follow a target vehicle
+   2-3 cars back from a shopping center/petrol station, or stake out a
+   high-risk driveway in advance. **Not observable by this system** — it's
+   watching the driveway, not the road; no vehicle-loitering-before-
+   resident-arrival tracking exists. Acknowledged blind spot, correctly
+   out of scope for v1.
+2. **Box-in** — as the resident's car stops at the gate waiting for it to
+   open, a second vehicle pulls in behind at an angle within seconds,
+   sealing off reverse. → maps to `boxing_in`.
+3. **Blitz / sprint** — within ~2 seconds of the block, 2-3 suspects exit
+   the blocking vehicle and sprint to the driver/passenger windows
+   (roughly opposite flanks — clears the convergence angular-spread gate).
+   → maps to `sprint_approach` + `multi_directional_convergence`.
+4. **Forced extraction** — a weapon is shown/tapped at the window, the
+   driver is physically pulled out. → maps to `weapon_at_window` +
+   `struggle`.
+5. **The split** — one hijacker gets into the driver's seat (**driver
+   possibly still inside** in some variants), both vehicles pull away
+   rapidly in opposite directions. → this is exactly the scenario the
+   "recently surrounded, now fleeing" fix above targets: the person who
+   converged is no longer a separate tracked "approaching person," so the
+   signal has to survive that disappearance.
+
+Practical implication for the correlator design below: because each event
+type has a different debounce duration (`boxing_in` needs 4s continuous
+before it can even register a nonzero score, `weapon_at_window` only needs
+0.5s), the **order events actually get flagged in the log will not
+necessarily match the real-world order above** — `sprint_approach` could
+get timestamped before `boxing_in` does, even though the block physically
+happened first. Any cross-event logic must be order-agnostic.
+
+## Cross-event correlator (designed and agreed this session — NOT YET BUILT)
+
+The five event types fire independently right now. The chronology above
+makes clear they're not independent in a real attack — `boxing_in` →
+`sprint_approach`/`convergence` → `struggle`/`weapon_at_window` → fleeing,
+all on the *same vehicle*, all within ~45 seconds, is a much stronger
+signal than any one event alone (each individually still has plausible
+innocent explanations — awkward parking, an argument, someone jogging up
+to say hi). Proposed design, explained in plain language to the user and
+explicitly confirmed correct ("Thats right") before the session moved on to
+other things — **this was never actually implemented**, it's a green-lit
+design waiting to be built:
+
+- **Anchor entity**: the resident's vehicle `track_id` — the one thread
+  that runs through `boxing_in` (as `resident_vehicle_track_id`),
+  `sprint_approach`/`struggle`/`weapon_at_window`/`multi_directional_convergence`
+  (all as `vehicle_track_id`). The blocking/getaway vehicle's track ID is
+  *not* the anchor — it only appears inside `boxing_in` as context.
+- **Co-occurrence within a window, not strict order** (see chronology
+  section above for why order can't be trusted) — check for 2+ distinct
+  event types landing on the same anchor vehicle within roughly 45-60
+  seconds (real-world number + some slack), not a stage-ordered state
+  machine.
+- **Adds a layer, doesn't replace anything** — the five events keep firing
+  exactly as they do now, independently useful for debugging/tuning. The
+  correlator would emit one additional "this looks like one connected
+  incident, treat as urgent" signal referencing which underlying events
+  triggered it.
+- **Explicit honesty caveat, already agreed with the user**: this compounds
+  several still-untuned, still-unvalidated rule-based heuristics. Agreeing
+  with each other raises *relative* confidence, it doesn't prove anything.
+  Frame output as "elevated priority for review," never "confirmed
+  hijacking."
+- **Known risk inherited, not introduced**: if people crowding the vehicle
+  cause the tracker to lose and reassign its ID mid-sequence (plausible
+  during the struggle/extraction stage with real footage), the correlator
+  loses the thread — same tracker-continuity weakness the rest of the
+  system already has, just more exposed here since it spans a longer
+  window than any single event type does.
+
+**Next session should ask the user whether they still want this built now**
+(likely yes — it was the direct topic before testing took over), or
+whether to keep prioritizing the zero-events diagnostic first. Given the
+diagnostic is actively blocking any real validation, probably diagnose
+first, build the correlator once individual events are confirmed to fire
+correctly on real footage — no point correlating five signals that aren't
+individually trustworthy yet.
+
 ## Architecture / repo layout
 
 Package: `driveway_guard`, under `src/driveway_guard/`. Full detailed
@@ -220,7 +327,7 @@ scripts/
                                  #   "Weapon detection" section below.
 
 calib/example_driveway.json     # placeholder calibration, 1920x1080 — must match your video's exact resolution or it errors loudly
-tests/                          # 42 passing unit tests, no video/model needed (pure logic)
+tests/                          # 47 passing unit tests, no video/model needed (pure logic)
 ```
 
 CLI: `python -m driveway_guard.run --video <path> --out <dir> [--calib <path>] [--weapon-model <path>] [--device cpu|cuda:0] ...`
@@ -244,31 +351,48 @@ log lines.
 ## Current status
 
 - All v1 milestones from the plan are built (scaffolding through polish).
-- **42/42 local pytest tests passing** (pure-logic tests only — geometry,
-  scorer, track state, feature extractor; no video/model dependency).
-  Confirmed passing again this session (`.venv/Scripts/python.exe -m
-  pytest -q` → `42 passed in 24.56s`) before committing.
+- **47/47 local pytest tests passing** (pure-logic tests only — geometry,
+  scorer, track state, feature extractor, event debounce; no video/model
+  dependency). 5 new tests added this session (weapon-class-filter fix had
+  no dedicated test — `WeaponDetector` needs a real `.pt` to instantiate,
+  untested at unit level; convergence fleeing-bonus + recently-surrounded
+  fix added 5 tests). Confirmed passing (`.venv/Scripts/python.exe -m
+  pytest -q` → `47 passed`) before committing.
 - Pushed to GitHub: **https://github.com/SMOKE484/mashtronicsAI** (public
-  repo). `main` is up to date through commit `7fa9c2f`. Full commit
+  repo). `main` is up to date through commit `7f0477f`. Full commit
   history as of end of session:
-  - `b2f156b` — "Add v1 driveway anomaly detection pipeline" (prior session)
+  - `b2f156b` — "Add v1 driveway anomaly detection pipeline" (session 1)
   - `30ff36a` — "Declare lap dependency explicitly; fix blocking-overlap
-    test expectation" (this session; these were pending-uncommitted at
-    session start, carried over from the prior session)
+    test expectation" (session 2)
   - `7fa9c2f` — "Add weapon detection training script and sourcing docs"
-    (this session)
+    (session 2)
+  - `7f0477f` — "Fix weapon class filtering; detect vehicle fleeing after
+    convergence" (session 3, this session) — bundles the
+    `WeaponDetector` non-threat-class-denylist fix, the convergence
+    fleeing-bonus + recently-surrounded-decoupling fix, and the `run.py`
+    flagged-events console summary. 10 files changed. See "Key design
+    decisions" above for the full rationale on each piece.
   - No uncommitted changes as of the end of this session — `git status`
-    was clean after the push.
-- **First real end-to-end pipeline run happened on Kaggle GPU** (T4), using
-  the user's own downloaded video (`Normal.mp4`, in Kaggle dataset
-  `training1`, real mount path
-  `/kaggle/input/datasets/vhulendamashamba/training1/Normal.mp4` — the
-  Kaggle sidebar display path is misleading, don't trust it, always verify
-  with `find /kaggle/input/ -iname "*.mp4"`). Result: ran cleanly through
-  300+ frames, **0 events flagged**. Good news for false-positive control
-  *if* detection was actually finding people/vehicles — **this has not yet
-  been visually confirmed** (annotated.mp4 from that run hasn't been
-  reviewed). Still a loose end, see "Next steps".
+    was clean after the push. (An `output.txt` scratch file — a pasted
+    Kaggle training log — is untracked and deliberately excluded from
+    every commit; harmless to delete if it's cluttering the working tree.)
+- **Two real end-to-end Kaggle test rounds so far, neither has produced a
+  confirmed-correct flagged event yet:**
+  - **Round 1** (session 2): `Normal.mp4` (`training1` Kaggle dataset,
+    real mount path
+    `/kaggle/input/datasets/vhulendamashamba/training1/Normal.mp4` — the
+    sidebar display path is misleading, always verify with
+    `find /kaggle/input/ -iname "*.mp4"`). Ran cleanly through 300+
+    frames, 0 events flagged. Never visually confirmed whether detection
+    was actually working — annotated.mp4 from that run was never reviewed.
+  - **Round 2** (this session, **in progress, unresolved** — see dedicated
+    section below): batch of 6 clips including 5 real sourced hijacking
+    videos, also 0 events across the board. This time a diagnostic *did*
+    confirm the detector sees people/vehicles in at least one of the
+    clips, so it's not a total detection failure — but the deeper
+    diagnostic needed to explain the zero-events result was handed to the
+    user and not yet run before the session ended. **This is the most
+    important thing to pick up next.**
 
 ## Weapon detection (picked up this session — training done, wiring/spot-check not done)
 
@@ -506,6 +630,17 @@ Weights confirmed written to `/kaggle/working/weapon_model/weapon_model.pt`
 wired into an actual `--weapon-model` pipeline run, not yet spot-checked
 against real footage** — those are still the open items.
 
+**Update, session 3: this checkpoint is now gone.** It only ever lived in
+`/kaggle/working`, which does not persist across separate Kaggle sessions
+(only within one continuous session/disk — see "Kaggle workflow" below,
+this distinction bit the user twice now). A fresh Kaggle session this
+session found `/kaggle/working` completely empty. **Needs retraining**
+(same command as above, ~35 minutes on a T4) **and this time saving
+`weapon_model.pt` as its own Kaggle Dataset** so it survives future
+sessions instead of relying on `/kaggle/working`. See "Kaggle testing
+round 2" below for the full account of what happened when testing
+proceeded without it.
+
 **Immediate next steps for the next session** (in order):
 1. ~~Check whether the Kaggle run finished~~ — done, see above, it finished.
 2. ~~Get `data.yaml` class names~~ — done, confirmed `person`/`weapon` from
@@ -533,6 +668,202 @@ against real footage** — those are still the open items.
    not the weapon dataset). Check whether they're on the dataset's own
    page (not the notebook's read-only Input side-panel) and whether their
    account has phone verification completed, if it's still blocking them.
+
+## Kaggle testing round 2 (this session — IN PROGRESS, UNRESOLVED, pick up here)
+
+This is the active thread and the single most important thing to continue.
+Goal: run the pipeline against real sourced hijacking footage and confirm
+events actually fire correctly. Result so far: **0 events on every clip
+tested**, cause not yet identified.
+
+### Security note (unresolved — check this first)
+
+A screenshot the user shared mid-session contained a **real Roboflow API
+key in plaintext** (visible in a `Roboflow(api_key="...")` cell from
+yesterday's training notebook). The user was told to rotate/regenerate it
+on Roboflow immediately (Settings → API Keys), since it had been exposed
+in the conversation. **Whether they actually did this was never
+confirmed** — worth checking early next session, and worth treating any
+Roboflow-auth errors as possibly explained by this if it comes up.
+
+### Setup this session
+
+- New Kaggle session (fresh `/kaggle/working` — confirmed empty,
+  `git clone` needed, not just `git pull`). This is the session where
+  `weapon_model.pt` was discovered to be gone (see "Weapon detection"
+  section above).
+- Video dataset uploaded: `/kaggle/input/datasets/vhulendamashamba/hijackings/`
+  containing `video1.mp4` through `video5.mp4`.
+- **Important correction**: earlier in this same session, 3 detailed
+  Gemini/Veo prompts were drafted for synthetic normal/near-miss/hijacking
+  test clips (see "Synthetic test clip prompts" section below) — but the
+  `hijackings` dataset turned out to be **real sourced CCTV footage, not
+  those synthetic clips**. Confirmed by inspecting a frame: burned-in
+  timestamp `08/27/2018 17:12:13`, a `CAMERA03` watermark, 640x480
+  resolution, ~41 fps, 1212 frames (~29.6s duration) — notably close to
+  the real-world "under 30-45 seconds" hijacking duration from the
+  chronology section above, consistent with this being genuine incident
+  footage. Don't assume future references to "the hijackings dataset" mean
+  AI-generated content — it doesn't.
+- No `--weapon-model` (lost) and no `--calib` (never built for this
+  dataset's resolution — the existing `calib/example_driveway.json` is
+  1920x1080, this footage is 640x480, incompatible) were used for the
+  batch run. So `weapon_at_window` and `boxing_in` (and the
+  calibration-gated convergence fleeing-bonus) were structurally disabled
+  for this run — only `struggle`, `sprint_approach`, and base
+  `multi_directional_convergence` (no fleeing bonus) were actually live.
+
+### Batch run and result
+
+Ran all 6 clips (5 hijacking videos + `Normal.mp4` from `training1`)
+through `python -m driveway_guard.run` via a loop, one output dir each
+under `/kaggle/working/results/<clip_name>/`. **Every single clip produced
+0 flagged events**, including clips the user confirms show real hijackings.
+Zero across the board (not "mostly zero, one partial hit") is the reason
+this reads as a likely systemic issue rather than just conservative
+thresholds — if detection/scoring were basically working, at least
+*something* on at least one real hijacking clip should have gotten close.
+
+### Diagnostic 1 — confirms detection is not totally broken
+
+Ran a standalone diagnostic (bypassing pose/weapon/scoring, just
+`Tracker.track()` directly) on the first 60 frames of `video3.mp4`:
+
+- `resolution: 640x480 | fps: 40.997 | frame_count: 1212`
+- `person detected in 12/60 frames, vehicle detected in 40/60 frames`
+- A displayed annotated frame showed a real, correctly-boxed vehicle
+  detection, confidence `0.37` — notably **right at the edge of the
+  `0.35` conf threshold** used by both the tracker and the default
+  `--conf` CLI flag.
+
+**Conclusion**: the detector genuinely does see people and vehicles in
+this real footage — this is not a codec/decode failure or a "model sees
+nothing" situation. Vehicle detections firing in only 40/60 frames (67%)
+at a borderline 0.37 confidence is a plausible early hint that detection
+may be flickering in and out across frames on real (lower-res, compressed,
+possibly motion-blurred) CCTV footage in a way it likely wouldn't on clean
+synthetic test data — worth keeping in mind, since intermittent
+tracking/detection would repeatedly reset the duration-based dwell/
+proximity timers that `struggle` and `boxing_in` depend on
+(`ProximityDwellTracker.update()` zeroes the clock the instant a pair
+isn't "active" for even one frame).
+
+### Diagnostic 2 — the critical next step, NOT YET RUN
+
+A second, deeper diagnostic script was written and handed to the user as
+"cell 8," but **the session ended before it was run and before any results
+came back**. This is the actual next action for the next session. It runs
+the full `Tracker` + `PoseEstimator` + `FeatureExtractor` +
+`compute_convergence` + raw `score_struggle`/`score_sprint`/
+`score_convergence` (bypassing `EventAggregator`'s threshold+debounce
+entirely) across the **whole** clip (not just 60 frames), and tracks the
+best/max value each signal ever reaches:
+`min_distance_norm`, `max_dwell_s`, `max_approach_speed_px_s`,
+`max_struggle_score`, `max_sprint_score`, `max_convergence_approachers`,
+`max_convergence_spread_deg`, `max_convergence_score`,
+`frames_with_pair`. The full script is in the conversation transcript
+(search for "Cell 8" — it imports directly rather than going through the
+CLI, using `sys.path.insert(0, "/kaggle/working/mashtronicsAI/src")` to
+work around the Jupyter kernel quirk below).
+
+**Once this runs, compare its output against these thresholds** (all in
+`RuleThresholds`, `scoring/rules.py`) to diagnose which of two very
+different problems this is:
+- If the max values come back *close to but under* threshold (e.g.
+  `max_struggle_score` = 0.4-0.6, `min_distance_norm` just above 0.08,
+  `max_dwell_s` just under 1.5s) → this is a **threshold-tuning problem**,
+  the scenario is being seen roughly correctly, thresholds are just too
+  strict for real footage (plausible — they're explicitly documented as
+  "starting guesses" never tuned against real clips).
+- If the max values come back *nowhere close* (e.g. `min_distance_norm`
+  never drops much below 0.5, `frames_with_pair` is near zero, convergence
+  never sees 2+ simultaneous approachers) → this is a **detection/tracking
+  robustness problem** on real footage (intermittent detection breaking
+  continuity, pose estimation failing more often on compressed/low-res
+  footage so `struggle`'s joint-velocity/arms-raised terms stay `None`,
+  or the framing/distance in this specific footage genuinely doesn't
+  bring bounding-box *centroids* as close together as the thresholds
+  assume even when a person is visibly at the window) — this needs
+  code/robustness work, not just threshold tuning.
+Key reference thresholds to compare against: `proximity_norm_threshold`
+(struggle) = 0.08, `struggle_dwell_min_s` = 1.5,
+`sprint_speed_px_s_threshold` = 650, `convergence_min_approachers` = 2,
+`convergence_angle_threshold_deg` = 90, and the flag threshold everything
+ultimately needs to clear, `risk_score_flag_threshold` = 0.65.
+
+### Jupyter/Kaggle operational gotcha discovered and solved this session
+
+`!pip install -q -e .` run in a notebook cell does **not** get picked up
+by that notebook's own already-running kernel process for a direct
+`import driveway_guard` — only by *new* subprocess-spawned `python`
+processes (e.g. `subprocess.run(["python", "-m", "driveway_guard.run", ...])`
+or `!python -m ...`), because editable-install path entries are only read
+by Python's `site` module at interpreter startup, and the kernel was
+already running before the install happened. This is why the batch run
+(subprocess-based) worked fine while a later cell doing
+`from driveway_guard.detection.tracker import Tracker` directly failed
+with `ModuleNotFoundError`. **Fix, no kernel restart needed**: put
+`sys.path.insert(0, "/kaggle/working/mashtronicsAI/src")` as the first
+line of any cell that needs to `import driveway_guard` directly rather
+than going through the CLI/subprocess. Apply this in every future
+diagnostic-style cell.
+
+### Notebook cell layout as of end of session (for resuming exactly)
+
+1. Yesterday's Roboflow dataset-download cell (leftover, not needed today).
+2. Yesterday's `cd`+`pull`+train command (leftover — don't reuse the
+   training line, checkpoint doesn't need retraining until it's actually
+   time to fix the "weapon_model.pt is gone" problem).
+3. This session's fresh `cd`/clone-if-missing + `git pull` + `pip install -e .`.
+4. `glob` over `/kaggle/input/**/*.mp4` to list all 6 clips.
+5. Batch-run loop (`subprocess.run`) over all 6 clips, no `--weapon-model`,
+   no `--calib`, one output dir each under `/kaggle/working/results/`.
+6. Read + print `events.json` from each result dir side by side — showed
+   0 events everywhere.
+7. Diagnostic 1 (raw tracker only, first 60 frames of `video3.mp4`, with
+   the `sys.path` fix) — ran, results above.
+8. Diagnostic 2 (full feature+scoring pipeline, whole clip, max-value
+   tracking) — **written and handed to the user, not yet run**. This is
+   where the session ended.
+
+## Synthetic test clip prompts (drafted this session, not currently the priority)
+
+Three detailed Gemini/Veo video-generation prompts were drafted for
+normal / near-miss / full-hijacking scenarios, all sharing one consistent
+fixed-CCTV-angle scene description so the same calibration file could be
+reused across all three. Full prompt text is in the conversation
+transcript, not reproduced here (they're long). Key points if picked back
+up later:
+- Keep the exact same static elevated driveway-camera scene description
+  across every prompt for framing consistency.
+- Content-filter guidance: avoid words like "gun"/"firearm"/"attack"/
+  "victim" in the weapon/extraction parts — phrase around neutral,
+  behavior-focused language ("dark handheld object," "gestures," "is
+  escorted away") since Gemini/Veo's safety filters react to the words,
+  not the underlying detection-relevant geometry, which doesn't need
+  graphic content anyway.
+- Individual Veo/Gemini clips are capped around ~8 seconds — a full
+  ~30-40s hijacking sequence needs generating as several per-stage clips
+  and stitching them, not one continuous generation.
+- **Not currently the priority** — the user is testing against real
+  sourced footage instead (see "Kaggle testing round 2" above), which is
+  preferable per the existing standing preference for real footage. Revisit
+  only if more controlled/repeatable synthetic variety is needed later
+  (e.g. isolating one event type cleanly, which real footage rarely gives
+  you cleanly).
+
+Also researched (in case a free video-gen tool is needed later): as of
+2026, Sora has no free tier at all (discontinued January-April 2026); Pika
+and Runway have free tiers but are low-resolution (Pika free tier is
+480p), short (5-10s), and watermarked — likely too degraded for reliable
+YOLO detection at driveway-camera distances; Kling/Luma no longer have
+meaningful free tiers. The more promising free route if needed: **open-
+source self-hosted models runnable on the same Kaggle GPU workflow already
+in use** — Wan 2.2 (Apache 2.0, Alibaba) or HunyuanVideo-1.5 (Tencent,
+tuned for consumer GPUs) — no watermark, no clip-count cap beyond Kaggle's
+own 30 GPU-hrs/week, though the commonly-recommended Wan 2.2 config wants
+a 24GB GPU vs. Kaggle's free ~15GB T4, so the lighter 5B variant would be
+needed.
 
 ## Standing instructions / preferences (carry these forward)
 
@@ -575,19 +906,25 @@ against real footage** — those are still the open items.
   sluggish; `--frame-stride` exists as an escape hatch if needed.
 - Disk space is not a concern (397 GB free of 475 GB at last check).
 
-## Kaggle workflow (validated as working across two sessions now)
+## Kaggle workflow (validated as working across three sessions now)
 
 1. New notebook → Accelerator: GPU T4 x2 → Internet: On.
 2. If `/kaggle/working/mashtronicsAI` doesn't already exist:
    `!git clone https://github.com/SMOKE484/mashtronicsAI.git && cd mashtronicsAI && pip install -q -e .`
-   If it **does** already exist from a prior run in the same session/disk
-   (Kaggle can persist `/kaggle/working` across notebook edits — confirmed
-   this session, this bit the user), `%cd /kaggle/working/mashtronicsAI`
-   and `!git pull` instead of re-cloning — re-cloning into a non-empty
-   directory fails with `fatal: destination path ... already exists`.
-   Always `git pull` even if it does exist, in case the clone predates a
-   later push (also happened this session — the stale clone didn't have
-   `scripts/train_weapon_model.py` yet until pulled).
+   If it **does** already exist from a prior run in the same session/disk,
+   `%cd /kaggle/working/mashtronicsAI` and `!git pull` instead of
+   re-cloning — re-cloning into a non-empty directory fails with
+   `fatal: destination path ... already exists`. Always `git pull` even
+   if it does exist, in case the clone predates a later push.
+   **Important correction from session 3**: `/kaggle/working` only
+   persists *within* one continuous session/disk (confirmed across
+   multiple notebook edits in session 2) — it does **not** survive into a
+   genuinely new session. Session 3 started with a completely empty
+   `/kaggle/working` despite session 2 having built a whole training run
+   there the day before, and lost `weapon_model.pt` as a result. **Never
+   treat anything in `/kaggle/working` as durable across sessions** —
+   anything worth keeping (trained checkpoints especially) needs to be
+   saved as a proper Kaggle Dataset, not left sitting in `/kaggle/working`.
 3. For pipeline runs on video: attach video via "Add Input" → Dataset. Get
    the real mount path with `find /kaggle/input/ -iname "*.mp4"` — don't
    trust the sidebar's displayed path, it's been wrong before (missing a
@@ -597,33 +934,66 @@ against real footage** — those are still the open items.
    command — don't duplicate it here beyond what's in the "Weapon
    detection" section above, keep README as the source of truth since
    it's more likely to be kept in sync with the actual script if the
-   dataset choice changes again.
-5. Known Kaggle friction point (**unresolved**): see "Standing
+   dataset choice changes again. **This time, save `weapon_model.pt` as a
+   Kaggle Dataset immediately after training** — see the point above about
+   why.
+5. **Jupyter kernel gotcha (session 3)**: after `!pip install -q -e .`, a
+   direct `from driveway_guard... import ...` in a notebook cell will fail
+   with `ModuleNotFoundError` even though `!python -m driveway_guard.run`
+   works fine — the notebook's own kernel process was already running
+   before the install happened. Fix: put
+   `sys.path.insert(0, "/kaggle/working/mashtronicsAI/src")` as the first
+   line of any cell that imports the package directly instead of going
+   through the CLI. See "Kaggle testing round 2" above for the full
+   account.
+6. Known Kaggle friction point (**unresolved**): see "Standing
    instructions"/"Weapon detection next steps" item 7 above re: adding a
    new dataset version to `training1`.
 
 ## Next steps (in priority order)
 
-1. **See "Weapon detection" section above** — this is the active thread.
-   Training finished with usable numbers (mAP50 0.744 on the `weapon`
-   class, classes confirmed `person`/`weapon`) and the keep-vs-fallback
-   decision is made (keep). What's left: download `weapon_model.pt`,
-   wire it in via `--weapon-model`, and spot-check on real footage.
-2. Once a weapon checkpoint's quality is confirmed and it's wired in,
-   resolve the older loose end: visually confirm the first Kaggle
-   pipeline run's `annotated.mp4` actually shows correct person/vehicle
-   detection (0 events flagged is only good news if detection was working
-   at all — never confirmed).
-3. Once weapon detection and basic detection/tracking are both confirmed
-   working, the previously-agreed testing roadmap continues: a person
-   actively approaching/interacting with a vehicle → a busier benign clip
-   (multiple people, false-positive check) → a two-vehicle boxing-in clip
-   (needs a **new calibration JSON** matching that clip's exact resolution
-   + a `resident_vehicle_hint` zone — boxing-in is silently skipped without
-   calibration) → real struggle/aggressive-approach footage for tuning
-   `RuleThresholds` in `scoring/rules.py`.
-4. AI-generated (Gemini/Veo) prompts for synthetic test clips were drafted
-   in the first session for each event type as a fallback/smoke-test
-   option, but the user has been sourcing real videos instead, which is
-   preferable — real footage should stay the priority for anything used to
-   tune thresholds.
+1. **Run "Diagnostic 2" from "Kaggle testing round 2" above.** This is the
+   single most important next action — everything else is downstream of
+   knowing *why* 0 events fired on real hijacking footage. The script is
+   already written (see that section, or search the conversation
+   transcript for "Cell 8"), just needs to actually be run and its output
+   compared against the reference thresholds listed there.
+2. Based on diagnostic 2's result, branch:
+   - **Scores close but under threshold** → tune `RuleThresholds` in
+     `scoring/rules.py` (they're explicitly "starting guesses," never
+     validated against real footage before now) and re-run.
+   - **Scores nowhere close** → investigate detection/tracking robustness
+     on real (lower-res, compressed) CCTV footage specifically — likely
+     candidates: intermittent detection breaking continuity-based dwell
+     timers (see diagnostic 1's 40/60-frame vehicle detection rate at a
+     borderline 0.37 confidence), pose estimation failing more often on
+     compressed footage, or a genuine framing/distance mismatch between
+     what the thresholds assume and what this footage actually shows.
+     Consider trying a lower `--conf` as a quick experiment either way.
+3. Build a calibration JSON matching the `hijackings` dataset's actual
+   640x480 resolution (the existing `calib/example_driveway.json` is
+   1920x1080 and won't work) if boxing-in and the convergence
+   fleeing-signal are to be tested against this footage — currently
+   neither has been exercised at all on real footage.
+4. Retrain the weapon checkpoint (lost this session, see "Weapon
+   detection" section) **and this time save `weapon_model.pt` as a
+   proper Kaggle Dataset**, not just `/kaggle/working`, before wiring it
+   back in via `--weapon-model` and spot-checking.
+5. Once individual events are confirmed firing correctly on real footage,
+   build the cross-event correlator — full design already agreed with the
+   user, documented in "Cross-event correlator" above, not yet
+   implemented. Confirm the user still wants it before building (it's
+   very likely yes, but confirm rather than assume after a gap in the
+   conversation).
+6. Confirm whether the exposed Roboflow API key (see "Security note" in
+   "Kaggle testing round 2" above) was actually rotated — unconfirmed as
+   of end of session.
+7. Once the above is solid, the previously-agreed testing roadmap
+   continues: a person actively approaching/interacting with a vehicle →
+   a busier benign clip (multiple people, false-positive check) → real
+   struggle/aggressive-approach footage for further tuning.
+8. Older still-open loose end: visually confirm the very first Kaggle run
+   (`Normal.mp4`, session 2) actually showed correct detection in its
+   `annotated.mp4` — never reviewed. Lower priority now that diagnostic 1
+   this session at least confirms detection works on *some* real footage,
+   but still an open item for that specific clip.

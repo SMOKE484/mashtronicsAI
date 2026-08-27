@@ -30,6 +30,7 @@ def _make_record(**overrides) -> FrameFeatureVector:
         vehicle_velocity_px_s=(0.0, 0.0),
         approach_speed_px_s=0.0,
         dwell_time_s=0.0,
+        close_dwell_time_s=0.0,
     )
     defaults.update(overrides)
     return FrameFeatureVector(**defaults)
@@ -37,14 +38,28 @@ def _make_record(**overrides) -> FrameFeatureVector:
 
 def test_struggle_zero_when_far_from_vehicle():
     t = RuleThresholds()
-    record = _make_record(person_vehicle_distance_norm=0.5, dwell_time_s=5.0)
+    record = _make_record(person_vehicle_distance_norm=0.5, close_dwell_time_s=5.0)
     assert score_struggle(record, t) == 0.0
 
 
 def test_struggle_zero_when_dwell_too_short():
     t = RuleThresholds()
     record = _make_record(
-        person_vehicle_distance_norm=0.01, dwell_time_s=0.1, max_joint_velocity_px_s=5000.0
+        person_vehicle_distance_norm=0.01, close_dwell_time_s=0.1, max_joint_velocity_px_s=5000.0
+    )
+    assert score_struggle(record, t) == 0.0
+
+
+def test_struggle_zero_when_only_loose_dwell_is_long():
+    """Regression test: a person who merely lingered in the wide recording
+    zone (dwell_time_s) without ever being continuously *close* enough
+    (close_dwell_time_s) must not satisfy the struggle dwell gate."""
+    t = RuleThresholds()
+    record = _make_record(
+        person_vehicle_distance_norm=0.01,
+        dwell_time_s=10.0,
+        close_dwell_time_s=0.1,
+        max_joint_velocity_px_s=5000.0,
     )
     assert score_struggle(record, t) == 0.0
 
@@ -53,7 +68,7 @@ def test_struggle_high_when_all_signals_present():
     t = RuleThresholds()
     record = _make_record(
         person_vehicle_distance_norm=0.01,
-        dwell_time_s=5.0,
+        close_dwell_time_s=5.0,
         max_joint_velocity_px_s=2000.0,
         arms_raised_score=0.9,
         person_person_contact=True,
@@ -66,7 +81,7 @@ def test_struggle_partial_from_joint_velocity_only():
     t = RuleThresholds()
     record = _make_record(
         person_vehicle_distance_norm=0.01,
-        dwell_time_s=5.0,
+        close_dwell_time_s=5.0,
         max_joint_velocity_px_s=t.joint_velocity_struggle_px_s * 2,
     )
     score = score_struggle(record, t)
