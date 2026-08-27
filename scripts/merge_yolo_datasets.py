@@ -35,7 +35,11 @@ Where merge_config.json looks like:
 `class_map` maps each of that source's own class names (as spelled in its
 own data.yaml) to a name in `target_classes`. Every class name the source
 actually has must appear in its `class_map` -- this fails loudly rather than
-silently dropping an unmapped class.
+silently dropping an unmapped class. A `class_map` value of `null` means
+"drop boxes of this class" (the image is still copied, as a background/
+negative example, if nothing else remains in its label file) -- use this to
+exclude a source class you don't want folded into any target class, e.g.
+{"Handgun": "weapon", "Knife": null, "Short_rifle": null}.
 """
 
 import argparse
@@ -68,27 +72,32 @@ def _load_source_names(data_yaml_path: Path) -> list[str]:
 
 
 def build_class_remap(
-    source_names: list[str], class_map: dict[str, str], target_classes: list[str]
-) -> dict[int, int]:
+    source_names: list[str], class_map: dict[str, str | None], target_classes: list[str]
+) -> dict[int, int | None]:
     """Maps each source-local class index to a target-class index, per
-    class_map. Raises if any source class name has no entry in class_map, or
-    maps to a name not present in target_classes -- no silent drops."""
-    remap: dict[int, int] = {}
+    class_map. A class_map value of None means "drop boxes of this class"
+    rather than remap them. Raises if any source class name has no entry in
+    class_map, or maps to a name not present in target_classes -- no silent
+    drops of a class missing from class_map entirely."""
+    remap: dict[int, int | None] = {}
     for local_id, name in enumerate(source_names):
         if name not in class_map:
             raise ValueError(f"source class {name!r} has no entry in class_map")
         target_name = class_map[name]
+        if target_name is None:
+            remap[local_id] = None
+            continue
         if target_name not in target_classes:
             raise ValueError(f"class_map target {target_name!r} not in target_classes")
         remap[local_id] = target_classes.index(target_name)
     return remap
 
 
-def remap_label_line(line: str, remap: dict[int, int]) -> str | None:
+def remap_label_line(line: str, remap: dict[int, int | None]) -> str | None:
     """Rewrites a YOLO label line's leading class-index per remap. Returns
-    None if the line's class index isn't in remap (shouldn't happen if
-    build_class_remap covered every source class, but skip rather than
-    crash on a single malformed line)."""
+    None to drop the line -- either class_map explicitly maps this class to
+    None, or (shouldn't happen if build_class_remap covered every source
+    class) the id isn't in remap at all."""
     parts = line.split()
     if not parts:
         return None
@@ -96,7 +105,10 @@ def remap_label_line(line: str, remap: dict[int, int]) -> str | None:
     if local_id not in remap:
         logger.warning("label line references unmapped class id %d, skipping line", local_id)
         return None
-    parts[0] = str(remap[local_id])
+    target_id = remap[local_id]
+    if target_id is None:
+        return None
+    parts[0] = str(target_id)
     return " ".join(parts)
 
 
