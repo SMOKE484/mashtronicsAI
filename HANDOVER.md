@@ -1,407 +1,374 @@
 # Handover: driveway-guard (mashtronicsAI)
 
-Written 2026-08-26, replacing the previous handover after a full incremental
-rewrite. The old handover covered four sessions of building and testing a
-five-event rule-based pipeline (struggle, boxing-in, weapon-at-window,
-sprint-approach, multi-directional convergence) against real Kaggle footage.
-That testing surfaced real bugs and real fixes, but also showed the number of
-coupled moving parts (pose estimation, calibration-dependent convergence
-math, five separate debounce states) made it hard to trust any single result
-— most of a session went into disentangling which of several systems was
-responsible for a given number.
+Written 2026-08-29, replacing the previous handover (2026-08-27) after a
+session investigating *why* the retrained weapon checkpoint keyed off
+false detections (car roof, side mirror) instead of real guns. **Root
+cause found and confirmed. A partial fix was tried and made things worse
+in a different way. Still not resolved — do not treat any checkpoint as
+validated.** Everything from before this session is still committed on
+`main` and recoverable via `git log` / `git show <hash>:<path>` — this
+document reflects only the current state, per this repo's standing
+practice of replacing the handover on a direction change rather than
+appending another session section.
 
-**Decision made this session: stop tuning the tangle, rebuild deliberately.**
-Prove one event type works end-to-end and is properly tuned on real footage,
-*then* add the next, one at a time, each validated before the next starts.
-Starting with weapon detection, since it already has the most validated
-groundwork (a trained checkpoint, confirmed genuine detections on real
-footage from the previous effort). This document reflects **only the current
-state after that rewrite** — the old session-by-session narrative is not
-reproduced here, but nothing is lost: everything retired is still committed
-on `main` through commit `d647e3f`, pushed to GitHub, recoverable at any time
-via `git log` / `git show d647e3f:<path>`.
+## tl;dr — where things stand right now
 
-**tl;dr of where things stand right now (updated 2026-08-27, retracting part
-of the same day's earlier update)**: Parts 1 and 2 are both done, committed,
-and pushed. `weapon_at_window` fires on both `video1.mp4` and `video3.mp4`
-with zero false positives on `Normal.mp4` — but a visual spot-check of the
-actual detection boxes (via `scripts/export_weapon_snapshots.py`) found the
-retrained checkpoint is **partly keying off false detections, not the actual
-gun**: on `video1.mp4`, 2 of the 4 highest-confidence hits land on a car roof
-and a car side-mirror (no weapon present at all), including one hit that was
-*inside* the event window this handover previously called "confirmed
-working." The other 2 hits land on a real person but with an oversized box
-around their whole dark-clothed silhouette, not a resolved gun shape. **Do
-not treat the retrained checkpoint as validated** — the event-firing test
-alone (does `weapon_at_window` fire at the right time, stay quiet on
-`Normal.mp4`) was not sufficient; it can pass while detecting the wrong
-thing. See "Validation against real footage — outcome, then retracted"
-below for the full detail and exported images. **User's decision: the next
-session should investigate the retrain itself** (why the merged dataset
-teaches dark/reflective-surface false positives) rather than immediately
-reverting to baseline or just raising the confidence threshold — those
-remain fallback options if the investigation doesn't pan out.
+**Root cause of the false positives, confirmed with data, not just visual
+suspicion**: the *original baseline* dataset
+(`weapon-detection-cctv-v3-dataset`, called `cctv_v3` in code/configs) —
+trusted all along as "the validated one" — was never actually spot-checked
+against its real images. This session opened its real training images and
+found a large fraction are **not CCTV footage at all**: gun-shop photos,
+product/gallery shots, stock photography (some iStock-watermarked), guns
+filling most of the frame in bright, close-up conditions. Measured on the
+real label files: `cctv_v3`'s "weapon" boxes average **20.6% of the
+frame** (median 4.17%), vs. the properly-CCTV-style `gun_cctv` source's
+**0.16%** (median 0.10%) — a ~40x scale mismatch for boxes meant to be the
+same object class. That mismatch, not the Part-1 retrain itself, is the
+most likely cause of the model learning "large/reflective/dark region" as
+a proxy for "weapon" instead of an actual gun shape.
+
+**Consequence**: the pre-retrain baseline checkpoint (previously assumed
+to be the safe fallback) was trained on this same contaminated data and
+was **never itself visually spot-checked** either — don't trust it without
+doing that first. Neither of the two fallback options from the previous
+handover (revert to baseline, or just raise the confidence threshold) are
+safe as-is; see "Why the simple fallbacks don't work" below.
+
+**Two corrective retrains were tried this session, both rejected:**
+1. Dropping `cctv_v3`'s weapon class entirely, training weapon-detection
+   purely on `gun_cctv` (1,741 boxes) — recall collapsed to near-zero on
+   real footage (max confidence 0.121 across an entire clip that
+   previously had 0.72-confidence hits). `cctv_v3` was contributing real
+   signal despite the contamination; an all-or-nothing cut was too blunt.
+2. Keeping both sources but capping `cctv_v3`'s box size to ≤2% of frame
+   area (new `max_area_norm` merge option, see below) — kept 1,762 of
+   `cctv_v3`'s 4,278 boxes, shrunk its median box area from 4.17% to
+   0.63% (much closer to `gun_cctv`'s 0.10%). This **did suppress** the
+   specific car-roof/mirror false positives from the first retrain (their
+   confidence dropped from 0.72/0.67 down to ~0.14), but real-footage
+   testing found new problems instead — see "Attempt 2 results" below.
+   **Not adopted.**
+
+**User's decision at end of session**: try training with a third,
+larger candidate dataset the user found on Kaggle
+(`Weapon_Detection_for_Yolo`, ~24,000 images, single unified `Weapon`
+class, includes ~1,544 explicit negative/background images) — see "New
+candidate dataset" below for what's known and what's still unverified
+about it. **This has not been downloaded, vetted, or trained on yet** —
+that's the next session's starting point, in a new chat.
 
 ## What this project is
 
 A production-track computer vision system that watches a **fixed driveway
-security camera** (target hardware: Dahua CCTV, RTSP-capable — not yet wired
-up) and flags candidate carjacking/hijacking events for human review.
+security camera** (target hardware: Dahua CCTV, RTSP-capable — not yet
+wired up) and flags candidate carjacking/hijacking events for human
+review. Five event types were designed collaboratively with the user:
 
-Five event types were designed collaboratively with the user (full rationale
-in `.claude/plans` if needed):
 1. **Struggle / aggressive contact** near a vehicle (hijacking-style)
 2. **Boxing-in** — a second vehicle blocking the resident's car's exit path
-3. **Weapon at window** — a gun visible at a vehicle window — **the only one
-   currently implemented, this phase's focus**
-4. **Sprint approach** — someone closing on a stationary vehicle at running
-   speed
-5. **Multi-directional convergence** — 2+ people approaching a vehicle from
-   different angles simultaneously
+3. **Weapon at window** — a gun visible at a vehicle window — **the only
+   one implemented, this phase's focus. Firearms only, deliberately not
+   knives** (see "New candidate dataset" below for why this matters).
+4. **Sprint approach** — someone closing on a stationary vehicle at
+   running speed
+5. **Multi-directional convergence** — 2+ people approaching a vehicle
+   from different angles simultaneously
 
-Types 1, 2, 4, 5 are designed and were previously implemented and tested, but
-their code is currently retired (see "What's retired" below) pending this
-incremental rebuild. They come back one at a time, using the retired code in
-git history as a starting point rather than being redesigned from zero.
+Types 1, 2, 4, 5 are designed but retired pending this incremental
+rebuild; recoverable from git history (`git show d647e3f:<path>`), not
+touched this session.
 
-## Part 1: expand the weapon dataset and retrain — done, checkpoint in use
+## The investigation, in order
 
-The existing `weapon_model.pt` (if you still have it downloaded locally —
-otherwise it needs retraining regardless, see "Kaggle workflow" below on why
-`/kaggle/working` doesn't persist across sessions) was trained on Roboflow's
-`weapon-detection-cctv-v3-dataset` (`nc=2`: `person`/`weapon`). Validation
-metrics: precision 0.833 / recall 0.652 / mAP50 0.744 on the `weapon` class
-specifically (person: 0.891/0.793/0.859) — solid precision, weak recall
-(roughly a third of true weapons missed in validation).
+### 1. Reviewed the exported snapshots from both test clips
 
-**Plan: add a second dataset and retrain**, rather than replacing the first
-(keeping the first dataset's `person` class matters — see "Weapon detection"
-in README.md for why). Dataset research this session, vetted by actually
-fetching each Roboflow Universe page (they return HTTP 403 without a
-browser-like User-Agent — `curl -A "Mozilla/5.0 ..."`) and spot-checking real
-sample thumbnails, not just page descriptions or search-result summaries:
+`snapshots_video1/` and `snapshots_video3/` (untracked, still in the repo
+root) hold annotated hit exports from the Part-1 retrained checkpoint
+(`cctv_v3` weapon boxes unfiltered + `gun_cctv`'s `Handgun`/`Short_rifle`).
+Visual review of all 8 hits found a clear pattern:
+- `video1.mp4`'s 4 hits were **inconsistent, clearly wrong shapes**: a
+  wide box on the car's roofline reflection (conf 0.72 — higher than
+  several of the "real-looking" hits below), a small box on the car's
+  mirror (0.67), a box engulfing the person's entire dark silhouette
+  (0.57), a box around a dark pant-leg (0.70).
+- `video3.mp4`'s 4 hits (conf 0.51–0.77, exported previously but never
+  actually reviewed until this session) were **consistent**: a small,
+  tall box at the same chest/waist position on the same person across all
+  4 frames as they walked.
 
-| Dataset | Images | Class | License | Verdict |
-|---|---|---|---|---|
-| `dietest/gun-cctv-detection` | 5,149 | `Guns` (single, clean) | CC BY 4.0 | **Picked.** 4/4 sampled thumbnails genuine CCTV-style footage (elevated angle, timestamp/camera-ID overlay). |
-| `gun-detection-1lttj/gun-detection-1fbbu` | 9,256 | `gun` | CC BY 4.0 | Larger but mixed quality — 1 of 2 samples was a watermarked Alamy stock photo. Documented fallback/top-up, not first pick. |
-| `mahad-ahmed/gun-detection-uemtc` | 6,824 | `gun` | CC BY 4.0 | Rejected — sampled thumbnail was a toy water gun on a Christmas tree. |
-| `augustus/guns_dataset_kaggle_cctv` | 3,356 | `guns` | CC BY 4.0 | Rejected — sampled thumbnail was a stock "pistol vs. revolver" product photo, not CCTV footage, despite the "kaggle_cctv" name. |
-| `simuletic/cctv-weapon-detection-dataset-vcloz` | 141 | `person-weapon` | — | Rejected — too small, and the merged class name is the same red flag pattern as previously-rejected noisy-label datasets. |
+**Key finding: confidence alone can't separate real from fake.** The
+car-roof false positive (0.72) scored higher than 3 of `video3.mp4`'s
+plausible real hits (0.51, 0.56, 0.56). Raising
+`weapon_confidence_threshold` to filter out the car-roof hit would also
+filter out most of the apparently-genuine ones. This rules out "just raise
+the threshold" as a real fix.
 
-**`scripts/merge_yolo_datasets.py`**: combines two-or-more Roboflow YOLO
-exports into one, remapping each source's own class names onto a unified
-target list via a JSON config (full shape in the script's own docstring).
-Output is a normal-shaped YOLO export (`train/valid[/test]` images+labels,
-`data.yaml`), so `scripts/train_weapon_model.py` consumes it with **zero
-changes** via `--data <merged>/data.yaml`. Supports a `null` class_map value
-to drop a source class's boxes entirely (added this session — see below).
+### 2. Built a ground-truth label inspector
 
-**What actually ran, and what was learned**:
-1. `dietest/gun-cctv-detection`'s real class list turned out to be
-   `['Handgun', 'Knife', 'Short_rifle']` (`nc=3`), not the single `Guns`
-   class the original research assumed — the dataset page's advertised class
-   list didn't match the actual exported `data.yaml`, same lesson as the
-   "verify, don't trust the description" pattern that rejected other
-   candidates.
-2. First attempt mapped all three classes onto `weapon`. Result was **worse
-   than baseline on every metric** (`weapon`: precision 0.728/recall
-   0.553/mAP50 0.629 vs. baseline 0.833/0.652/0.744) — folding knives and
-   rifles into one label with handguns diluted the class.
-3. Second attempt dropped `Knife`/`Short_rifle` (mapped to `null`, i.e.
-   excluded from training as a class, image kept as a background example)
-   and kept only `Handgun → weapon`. Slightly better but still below
-   baseline (`weapon`: 0.728→0.768 precision, recall still ~0.55).
-4. **User explicitly wants any gun type covered, not just handguns** — final
-   config keeps `Handgun → weapon` and `Short_rifle → weapon`, only
-   `Knife → null` (dropped). Metrics: `person` 0.835/0.806/0.852, `weapon`
-   0.768/0.555/0.646 (precision/recall/mAP50) — still below the original
-   baseline in aggregate, particularly weapon recall (0.555 vs. 0.652).
-5. **Despite the weaker aggregate validation metrics, this checkpoint passed
-   real-footage validation** (see below) — the merged-dataset validation
-   split isn't apples-to-apples with the original single-dataset baseline
-   (different image pool), so don't over-index on that comparison alone.
-   This checkpoint is the one currently in use.
-6. The Roboflow API key in use is the same one flagged in an earlier session
-   as possibly exposed in a shared screenshot. **User explicitly decided to
-   keep using it rather than rotate** (2026-08-27) — a conscious call, not an
-   oversight; revisit only if the user's stance changes. A local untracked
-   `credentials.txt` in the repo root still has this key in plaintext — never
-   add it to git.
+**`scripts/inspect_dataset_labels.py`** (new, committed at `0e0025d`):
+reads a YOLO `data.yaml`, pulls every ground-truth box for a given class,
+and reports box-shape stats (width/height/aspect-ratio/area, all
+normalized). Since `merge_yolo_datasets.py` prefixes every copied filename
+with its source name, this script can split stats **by source** just from
+filenames in the *merged* dataset (`--group-by-prefix`) — no need to keep
+the original per-source exports around separately. It also exports a
+random sample and the most-elongated boxes per group as annotated crops,
+for eyeballing ground truth directly rather than trusting page
+descriptions.
 
-## Part 2: rebuild the pipeline code — done, committed, validated on real footage
+Run against the Part-1 merged dataset's `train` split, class `weapon`:
 
-### What's reused as-is (unchanged from before)
+| | `cctv_v3` (n=4278) | `gun_cctv` (n=1741) |
+|---|---|---|
+| median box area | 4.17% of frame | 0.10% of frame |
+| mean box area | **20.6%** of frame | 0.16% of frame |
+| median aspect ratio | 1.45 | 2.57 |
 
-- `src/driveway_guard/detection/tracker.py` — `Tracker` (YOLO + ByteTrack).
-- `src/driveway_guard/detection/types.py` — `TrackedObject`, `ObjectClass`.
-- `src/driveway_guard/detection/weapon_detector.py` — `WeaponDetector`,
-  including the non-threat-class denylist fix
-  (`_NON_THREAT_CLASS_NAMES = {"person", "hand", "phone"}`).
-- `src/driveway_guard/imaging.py` — `crop_with_padding`.
-- `src/driveway_guard/sources/` — `FrameSource`, `VideoFileSource`.
-- `src/driveway_guard/scoring/events.py` — `EventAggregator`, `FlaggedEvent`
-  (generic over `(event_type, key_tuple)`, reused directly by the new
-  weapon scorer).
-- `src/driveway_guard/output/event_log.py`, `output/video_writer.py`.
-- `src/driveway_guard/output/overlay.py` — kept `draw_tracks`/
-  `draw_text_banner`; removed `draw_skeleton` (no pose stage right now).
+The random-sample crops from the `cctv_v3` group confirmed why: filenames
+and image content include `Gun-shop-Ticker`, `buying-a-shotgun-at-...`,
+`Hello_MG1648042266099`, `gallery233`, iStock-watermarked images, soldiers
+aiming rifles outdoors, a rifle laid on a table — professional/stock gun
+photography, not surveillance footage. `gun_cctv`'s crops, by contrast,
+genuinely are elevated-angle hallway/retail security-camera frames with a
+small distant box, matching what Part 1's original vetting claimed for
+it. `cctv_v3`'s `most_elongated` group also showed a secondary, smaller
+issue even within its legitimately-CCTV-style images: some boxes are
+stretched around a person's leg with no gun visible in them at all — loose
+ground truth even in the non-contaminated subset.
 
-### What's retired (git rm'd locally, not yet committed; fully recoverable via `git show d647e3f:<path>`)
+### 3. Added a per-source box-area filter to the merge script
 
-- `src/driveway_guard/pose/` (struggle-only)
-- `src/driveway_guard/features/` — `schema.py`, `extractor.py`,
-  `convergence.py`, `track_state.py`
-- `src/driveway_guard/calibration/` — `schema.py`, `geometry.py`
-- `src/driveway_guard/scoring/rules.py` — old `RuleBasedScorer` +
-  `score_struggle`/`score_boxing_in`/`score_sprint`/`score_convergence` +
-  `RuleThresholds`
-- `src/driveway_guard/scoring/base.py` — old `RiskScorer` ABC (tied to the
-  5-event feature schema; not reintroduced until there's a second scorer
-  implementation to actually abstract over)
-- `calib/example_driveway.json`
-- `tests/test_rule_scorer.py`, `tests/test_feature_extractor.py`,
-  `tests/test_track_state.py`, `tests/test_calibration_geometry.py`
+**`scripts/merge_yolo_datasets.py`** (updated, committed at `f098ed2`):
+new optional `max_area_norm` field on a source's config, e.g.
+`{"max_area_norm": {"weapon": 0.02}}` — drops any box remapped to that
+target class whose normalized area exceeds the cap, without dropping the
+source's contribution to the class entirely. Existing behavior is
+unchanged when the field is omitted. `remap_label_line()` takes an
+optional `max_area_norm: dict[int, float]` (keyed by target class id).
 
-`pydantic` dropped from `requirements.txt`/`pyproject.toml` (only
-`calibration/schema.py` used it). `pyyaml` added (used by the new merge
-script).
+### 4. Two corrective retrains, both on Kaggle (GPU T4), both rejected
 
-`scripts/diagnose_pipeline.py` and `scripts/inspect_frame.py` are left in
-place but **currently broken** — they import the retired modules
-(`FeatureExtractor`, `PoseEstimator`, `compute_convergence`,
-`CalibrationConfig`) and will fail at import time until those come back.
-`scripts/export_weapon_snapshots.py` and `scripts/train_weapon_model.py` are
-untouched and still work. `scripts/inspect_weapon_hits.py` was **not**
-actually working despite an earlier version of this file claiming so — it
-still imported the retired `RuleThresholds` from `scoring.rules`. Fixed this
-session to import `WeaponThresholds` from `scoring.weapon` instead; also
-updated its longest-continuous-run calculation to use
-`thresholds.weapon_max_gap_s` (see below) instead of a hardcoded 5-frame gap,
-so its diagnostic output matches what the real pipeline would actually do.
+**Attempt 1 — drop `cctv_v3`'s weapon class entirely** (`weapon: null` for
+that source, `gun_cctv`'s `Handgun`/`Short_rifle → weapon` as the sole
+source). Aggregate metrics: weapon precision 0.746 / recall 0.494 / mAP50
+0.599 — worse than both prior checkpoints, which is expected (the earlier
+"better" numbers were inflated by validating on the same easy stock-photo
+domain the training data came from). Real-footage test on `video1.mp4`
+(`scripts/inspect_weapon_hits.py --conf 0.1`): **max confidence 0.121
+across the entire clip** — the model essentially can't detect the weapon
+at all anymore. `gun_cctv` alone (1,741 boxes) isn't enough signal by
+itself. **Rejected** — too blunt.
 
-### New: weapon-only pipeline
+**Attempt 2 — `max_area_norm: {"weapon": 0.02}` on `cctv_v3`, `gun_cctv`
+unchanged.** Merged dataset: `cctv_v3` kept 1,762/4,278 boxes (41%),
+median area down to 0.63% (mean not re-measured after filtering, but the
+worst outliers are gone by construction). Trained; **metrics.json from
+this run was never captured/pasted in this session** — only real-footage
+behavior was checked, on three clips:
 
-**`src/driveway_guard/scoring/weapon.py`** (new):
-- `WeaponThresholds`: `weapon_confidence_threshold=0.5`,
-  `weapon_min_duration_s=0.15` (tuned down from an initial 0.5 default — see
-  "Validation against real footage — outcome" below), `event_cooldown_s=5.0`,
-  `weapon_max_gap_s=0.15` (added this session, see below).
-- `score_weapon_hit(confidence, threshold)` — `0.0` below threshold or
-  `None`, else passthrough confidence.
-- `WeaponScorer` — wraps one `EventAggregator`. **Keyed by vehicle track ID
-  alone, not `(person, vehicle)`.** This was an open decision in the old
-  handover, now implemented: real footage (`video3.mp4`, previous session)
-  showed weapon hits landing on 5 different person track IDs within a ~3.5s
-  span as the tracker lost and reacquired the same person — which would
-  reset a `(person, vehicle)`-keyed debounce clock on every switch. Keying
-  by vehicle alone survives that churn; contributing person IDs are still
-  recorded in the emitted event's `track_ids`, just not part of the key.
-  Regression-tested in `tests/test_weapon_scorer.py` by simulating hits on
-  the same vehicle landing on different person IDs across frames.
+- **`video1.mp4`**: two clusters clear the 0.5 threshold — t≈4.96–5.06s
+  (peak 0.611) and t≈6.08–6.12s (peak 0.562) — but longest continuous run
+  is 0.10s, just under the 0.15s `weapon_min_duration_s` gate, so no event
+  fired. Visually, the box lands at the person's **ankle/foot**, against
+  the pavement — not a plausible gun position. Likely a *different* shape
+  shortcut (dark leg against light pavement) rather than a genuine
+  detection, though not conclusively confirmed either way. **The old
+  car-roof (0.72) and mirror (0.67) hits are gone / suppressed to ~0.14**
+  — that part of the fix worked.
+  - Note: this run's `video1.mp4` had a different resolution/frame count
+    (816×448, 595 frames) than the file used earlier in the session
+    (832×464, 828 frames) despite being the "same" filename
+    (`/kaggle/input/datasets/vhulendamashamba/videos/video1.mp4`). Not
+    resolved — worth confirming next session whether the Kaggle input
+    dataset attachment changed, or the file itself did, before trusting
+    frame-number-based comparisons across runs.
+- **`video3.mp4`**: max confidence dropped hard, from the earlier
+  checkpoint's 0.77 peak down to **0.224**, in roughly the same t≈18.2–
+  18.8s window that looked genuinely plausible before. Real recall loss
+  on footage that previously looked like the project's best evidence of a
+  working detector.
+- **`Normal.mp4`** (576×1024, portrait, 30fps, 340 frames — confirmed by
+  the user this is genuinely the no-weapon control clip): 3 consecutive
+  frames clear the 0.5 threshold, **peak confidence 0.693** — higher than
+  most of what we've confirmed as genuine elsewhere — around t≈2.53–2.60s.
+  No event fired only because the run was 0.07s, under the 0.15s gate.
+  **This is too close for comfort on footage that's supposed to have zero
+  weapon presence.**
+- Snapshot exports were requested for both `video3.mp4`'s weaker hit and
+  `Normal.mp4`'s 0.693 spike (`export_weapon_snapshots.py --min-conf
+  0.15`/`0.4` respectively, output dirs
+  `/kaggle/working/snapshots_v3_video3` and `snapshots_v3_normal`) **but
+  the images were never reviewed before the session ended** — open item,
+  do this first next session if this checkpoint direction is revisited.
 
-**Behavior change worth knowing about**: the old `RuleBasedScorer` had a
-quirk — `score_weapon()` zeroed anything below `weapon_confidence_threshold`
-(0.5), but the *actual* `EventAggregator` gate that had to be cleared for an
-event to ever start accumulating duration was `risk_score_flag_threshold`
-(0.65), because that one shared field was reused across all 5 event types.
-So real events effectively needed confidence ≥0.65, not ≥0.5, even though
-0.5 was the "documented" weapon threshold. The new `WeaponScorer` collapses
-this to one clear threshold (0.5 default, fully configurable via
-`--weapon-confidence-threshold`). This is a deliberate simplification, not
-an accidental regression.
+**Conclusion**: capping `cctv_v3`'s box size suppressed the two specific
+false positives it was targeted at, but didn't fix the underlying
+problem — it just surfaced a different one (possible new shortcut on
+`video1.mp4`'s ankle/leg region, a concerning near-miss on the `Normal.mp4`
+control, and a real recall loss on `video3.mp4`). **Not adopted as the
+checkpoint in use.**
 
-**Second, more impactful bug found during real-footage validation**:
-`EventAggregator.update()` reset its duration streak to zero on **any single
-below-threshold sample**, no tolerance at all. Real per-frame confidence is
-noisy — a genuine ~1s detection with one frame that dipped below threshold
-counted as two separate sub-threshold runs, neither long enough to fire.
-Fixed by adding `weapon_max_gap_s` (default 0.15s): a below-threshold sample
-no longer resets the streak unless the elapsed time since the last
-above-threshold sample exceeds this gap. This is generic to `EventAggregator`
-itself (shared code, not weapon-specific) via a new optional `max_gap_s` param
-on `update()`, defaulting to `0.0` (old strict behavior) for any caller that
-doesn't pass it.
+### Why the simple fallbacks don't work
 
-**`pipeline.py`, `config.py`, `run.py`** — rewritten, same filenames. CLI
-shape: `python -m driveway_guard.run --video <path> --out <dir>
---weapon-model <path> [--detector-model yolo11n.pt] [--conf 0.35]
-[--device cpu] [--frame-stride 1] [--no-video-output] [--log-level INFO]
-[--weapon-conf 0.4] [--weapon-proximity-norm 0.15] [--weapon-pad-ratio 0.4]
-[--weapon-confidence-threshold 0.5] [--weapon-min-duration-s 0.15]
-[--event-cooldown-s 5.0] [--weapon-max-gap-s 0.15]`. `--weapon-model` is now
-**required** — no more "skip the stage if omitted," since weapon detection is
-the entire point of this phase. No `--calib`, no `--pose-model` (those flags
-are gone, not just defaulted).
+- **Revert to pre-retrain baseline**: also trained on the contaminated
+  `cctv_v3` weapon class (that's the *only* weapon source the baseline
+  ever had), and its "solid" 0.833 validation precision was measured on a
+  held-out split of the same stock-photo-heavy data — never tested
+  against anything resembling real driveway footage, and never visually
+  spot-checked. Don't assume it's clean.
+- **Just raise `weapon_confidence_threshold`**: ruled out directly — the
+  car-roof false positive (0.72) scores higher than several of the
+  hits we've judged most likely to be genuine (0.51–0.56 on `video3.mp4`).
+  A confidence-only cutoff can't separate them.
 
-### New tests
+## New candidate dataset — found by user, not yet vetted or used
 
-- `tests/test_weapon_detector.py` — `WeaponDetector.detect()` had **no** unit
-  test before (only real-footage validation). Now covers the non-threat-class
-  denylist argmax fix directly (mocks the YOLO model via
-  `unittest.mock.patch("driveway_guard.detection.weapon_detector.YOLO")`,
-  since real inference isn't needed to test the class-filtering logic), plus
-  a proximity-gating test (far person never even reaches the model).
-- `tests/test_weapon_scorer.py` — `score_weapon_hit` pure-function cases,
-  a duration-debounce integration test, a "never clears confidence
-  threshold" negative test, the vehicle-only-keying regression test
-  described above, and two gap-tolerance tests (a brief dip within
-  `weapon_max_gap_s` must not reset; a gap longer than it still must).
+Kaggle dataset `Weapon_Detection_for_Yolo` (exact URL/owner slug not yet
+captured — get this from the user next session before trying to download
+it). Per its listing page:
+- ~24,000 images (18,186 train / 4,546 val / ~1,200 test).
+- **Single unified `Weapon` class** — pistols, knives, handguns, etc. all
+  merged into one label, no way to separate them back out. **This is a
+  structural mismatch with the project**: `weapon_at_window` is
+  deliberately firearms-only (Part 1 explicitly dropped `Knife → null`).
+  Using this dataset's class as-is would reintroduce knife detections
+  with no way to filter them back out after the fact.
+- Merged from "Multiple Public Weapon Datasets" (Roboflow/GitHub, per its
+  own description) plus **Sohas Weapon Detection** (converted from Pascal
+  VOC), plus **~1,544 explicit negative/background images** (phones,
+  laptops, empty rooms — empty label files). This is the most
+  differentiated thing it offers: **neither `cctv_v3` nor `gun_cctv` has
+  any labeled non-weapon images at all** — every image in both current
+  sources has a gun in it somewhere. The complete absence of hard/soft
+  negatives in current training data is a plausible contributor to the
+  shortcut-learning problem this whole session has been chasing (a model
+  never shown "this dark/reflective/elongated thing is NOT a weapon" has
+  no reason not to fire on one).
+- Two preview thumbnails were manually reviewed (from the Kaggle listing
+  page, i.e. **cherry-picked by the uploader, not a random sample** — the
+  same caveat that caught `cctv_v3` out): one eye-level indoor demo photo
+  (reasonable gun-to-frame size, not stock-photo-huge, but not
+  CCTV-angle either), one genuinely convincing elevated
+  fisheye-lens hallway shot with a timestamp overlay
+  (`2019-05-16 21:17:09`) — closer to this project's actual camera
+  domain. Encouraging, but **two hand-picked preview images are not
+  equivalent to actually pulling real random samples and box-size stats
+  from the label files**, which is what `inspect_dataset_labels.py` was
+  built to do and hasn't been run against this dataset yet.
 
-**11/11 tests passing** (`.venv/Scripts/python.exe -m pytest -q`).
+**User's decision: proceed to train using this dataset next session.**
+Before spending GPU time on it:
+1. Get the actual Kaggle dataset reference from the user (URL or
+   `kaggle datasets download` slug).
+2. Download it and run `scripts/inspect_dataset_labels.py` directly
+   against its own `data.yaml` (works standalone, doesn't require merging
+   first) to get real box-size stats and random-sample crops, the same
+   vetting every other candidate source has now gotten.
+3. Decide the integration approach given the single-class/knife problem —
+   options on the table but not decided: (a) use only its ~1,544 negative
+   images as background examples merged into the existing `cctv_v3` +
+   `gun_cctv` training set, leaving the weapon-class data untouched, which
+   directly targets the negatives gap without inheriting the knife-mixing
+   problem; (b) take its full weapon class anyway and accept the
+   knife/gun conflation; (c) something in between (e.g. filter by
+   filename/source if the merged dataset's provenance is distinguishable
+   per-image, similar to how `cctv_v3`/`gun_cctv` could be told apart by
+   filename prefix — untested whether this dataset preserves that kind of
+   per-source traceability).
+4. Whatever gets trained, run the **same real-footage validation this
+   session established**: `inspect_weapon_hits.py --conf 0.1` on all
+   three of `video1.mp4`, `video3.mp4`, `Normal.mp4` first (cheap), then
+   `export_weapon_snapshots.py` + actual visual review of the crops for
+   any clip with hits — do not trust event-firing or aggregate metrics
+   alone. This session's whole finding was that both of those can look
+   fine while the underlying detection is wrong.
 
-## Validation against real footage — outcome, then retracted (2026-08-27)
+## What's reused as-is / retired
 
-Ran on Kaggle (fresh notebook, GPU T4) against the retrained checkpoint from
-Part 1 (`Handgun`+`Short_rifle → weapon`, `Knife` dropped).
-
-**First pass, at the then-defaults (`weapon_confidence_threshold=0.5`,
-`weapon_min_duration_s=0.5`)**: zero events on `video1.mp4`, `video3.mp4`,
-*and* `Normal.mp4`. Looked like a clean-but-useless pass at first (no false
-positives, but also no true positives). Diagnosed with
-`scripts/inspect_weapon_hits.py --conf 0.1` (after fixing its stale import,
-see above) run against the raw per-frame confidence: the model **was**
-detecting the weapon repeatedly, with strong confidence (up to 0.72 on
-video1, 0.77 on video3) — this was not a detection failure. The
-`EventAggregator` zero-tolerance reset bug (described above) was the actual
-cause: single-frame confidence dips broke every run into pieces under ~0.22s,
-never reaching the 0.5s duration requirement.
-
-**After the `weapon_max_gap_s` fix**, replaying the same logged confidence
-values locally showed the longest bridgeable run was still only ~0.15–0.22s
-(gap tolerance alone doesn't manufacture duration that isn't there) — so
-`weapon_min_duration_s` also needed to drop, to 0.15s. This is now the
-code's default in `WeaponThresholds`/`RunConfig`/`--weapon-min-duration-s`.
-
-**Final result at `weapon_confidence_threshold=0.5`, `weapon_min_duration_s=
-0.15`, `weapon_max_gap_s=0.15`**:
-- `video1.mp4`: 1 `weapon_at_window` event, t=10.35–10.57s, peak_score=0.716
-- `video3.mp4`: 1 `weapon_at_window` event, t=18.73–18.90s, peak_score=0.770
-- `Normal.mp4`: 0 events (no false positive at this tighter duration)
-
-At this point the handover (in an earlier revision, same day) called this
-"the first confirmed correctly-firing event on real footage for the whole
-project." **That conclusion was premature and is retracted below** — the
-event-firing test only checks *timing* (did an event fire when it should,
-stay quiet when it shouldn't), which turned out to not be sufficient.
-
-### Visual spot-check (`scripts/export_weapon_snapshots.py`) — found real false positives
-
-Exporting and eyeballing the actual annotated detection boxes (not just the
-debounced event timestamps) on `video1.mp4`'s 4 highest-confidence hits
-(≥0.5 confidence, ≥0.3s apart) found:
-
-- `frame00421_t10.40s_conf0.72` — the "weapon" box is on **the black car's
-  roof**. No weapon present there. This frame falls *inside* the event
-  window (t=10.35–10.57s) that was just called "confirmed working."
-- `frame00464_t11.46s_conf0.67` — box on **the car's side mirror**. Also no
-  weapon.
-- `frame00218_t5.38s_conf0.57` and `frame00234_t5.78s_conf0.70` — box lands
-  on an actual person in dark clothing (plausibly the "second gunman" from
-  earlier sessions' notes), but oversized around their whole dark silhouette
-  rather than resolving a specific gun shape — consistent with the model
-  using "dark blob near a person" as a proxy signal rather than genuine
-  weapon-shape recognition.
-
-**Conclusion**: the retrained checkpoint (Part 1's final
-`Handgun`+`Short_rifle → weapon` merge) is at least partly keying off
-dark/reflective surfaces, not the actual weapon. The `video1.mp4` event that
-fired at t=10.35–10.57s is contaminated by at least one of these false
-detections — it is not established that a genuine weapon detection is what
-made it fire. This lines up with the checkpoint's weaker-than-baseline
-validation precision (0.768 vs. baseline 0.833) recorded in Part 1 — the
-aggregate metrics were already hinting at this, and the visual check
-confirmed it concretely. `video3.mp4`'s hits have not yet been visually
-spot-checked the same way (its snapshots were exported but not reviewed
-before this note was written) — do that first thing next session, same
-method, before assuming it's clean.
-
-**User's decision (2026-08-27): investigate the retrain itself next
-session**, in a separate chat — i.e. figure out *why* the merged dataset
-teaches this dark-surface shortcut (dataset composition? training epochs/
-hyperparameters? something about how `gun_cctv`'s images differ from
-`cctv_v3`'s?) rather than immediately falling back to either of the other
-two options that were on the table and remain available if the
-investigation stalls:
-- **Revert to the original pre-retrain checkpoint** (`person`/`weapon`,
-  precision 0.833/recall 0.652/mAP50 0.744) that the previous session called
-  "confirmed genuine detections" — but that claim was never itself
-  visually spot-checked with `export_weapon_snapshots.py` either, so don't
-  assume it's clean without doing the same check on it first.
-- **Raise `weapon_confidence_threshold`** (e.g. to 0.75–0.8) on the current
-  checkpoint and re-check whether a genuine gun detection survives on its
-  own once the car-roof/mirror hits (0.67–0.72) are filtered out.
-
-Either way: **do not adopt this checkpoint, and do not treat weapon
-detection as validated**, until a checkpoint's hits have been visually
-spot-checked and shown to actually be a weapon, not just shown to fire a
-debounced event at a plausible time.
-
-## Explicitly out of scope right now
-
-Struggle, boxing-in, sprint-approach, multi-directional convergence, the
-cross-event correlator design (still agreed with the user, never built —
-anchor on resident vehicle track ID, co-occurrence within ~45-60s, not a
-stage-ordered state machine), and the still-open base-detector
-confidence/model-size tuning thread (`yolo11s.pt` + lower confidence — found
-to genuinely fix a missed second-gunman detection on `video1.mp4`, but also
-measurably raised false-positive risk on `Normal.mp4`: `max_struggle_score`
-0.0→0.4, `max_sprint_score` 0.0→0.51 — needs an intermediate confidence value
-tested, not resolved) are all deliberately untouched. Full detail on all of
-these, if needed, is recoverable from this file's git history
-(`git log -- HANDOVER.md`) or from `.claude/plans`.
+Unchanged from the 2026-08-27 handover — see `git show
+c209787:HANDOVER.md` for the full "What's reused as-is" / "What's
+retired" breakdown if needed. Nothing in `src/driveway_guard/` changed
+this session; only `scripts/inspect_dataset_labels.py` (new) and
+`scripts/merge_yolo_datasets.py` (extended) changed.
 
 ## Standing instructions / preferences
 
 - **Never add Claude as a co-author/contributor on commits in this repo.**
 - Git identity: name `smoke`, email `vhulendamashamba4@gmail.com`.
-- User prefers testing on **Kaggle (free GPU)** over local CPU runs — tight
-  local RAM (see Environment below).
-- **Actually vet any sourced dataset/checkpoint** — real class list fetched
-  from the actual page/export (not a search-result summary or the project's
-  own marketing description), real image count, license, and now also:
-  **spot-check real sample thumbnails**, not just the page description —
-  this session found two "CCTV"-named datasets whose actual sample images
-  were a toy gun and a stock product photo. Roboflow Universe pages need a
-  browser-like User-Agent to fetch via curl/WebFetch (plain requests get
-  HTTP 403).
-- This session's other standing instruction: **when a chunk of work
-  fundamentally changes direction (like this rewrite), replace the handover
-  rather than appending another session section to an already-long one.**
+- User prefers testing on **Kaggle (free GPU)** over local CPU runs.
+- **Actually vet any sourced dataset/checkpoint** — this session is the
+  strongest example yet of why: `cctv_v3` was trusted for two full
+  sessions purely because of its name and the fact that it was already in
+  use, and turned out to be the actual root cause once someone opened the
+  real files. Real class list, real image count, license, real sample
+  thumbnails (not page descriptions), and now also: **real box-size
+  stats via `inspect_dataset_labels.py`** — a dataset can look right in
+  a hand-picked preview and still be wrong in aggregate.
+- Roboflow Universe pages need a browser-like User-Agent to fetch via
+  curl/WebFetch (plain requests get HTTP 403) — but note their pages are
+  client-rendered (no useful data in the raw HTML beyond the app shell);
+  this doesn't help pull real stats, only confirms the page loads.
+- **When a chunk of work fundamentally changes direction, replace the
+  handover rather than appending another session section to an
+  already-long one** (this document is itself an example).
+- New script `scripts/inspect_dataset_labels.py` needs the real dataset
+  to run — no dataset is cached locally (`data/input`, `data/samples` are
+  both empty), same "Kaggle working doesn't persist" reason as everything
+  else. It runs fine as a plain script via `!python scripts/...` from a
+  subprocess-spawned Kaggle cell without needing a kernel restart, even
+  right after `pip install -q -e .` in the same session (the "already-
+  running kernel doesn't pick up new installs" gotcha only affects direct
+  `import driveway_guard...` in a notebook cell, not `!python` subprocess
+  calls).
 
 ## Environment notes
 
 - Machine: Windows 11, repo at
   `c:\Users\vhule\OneDrive\Desktop\Projects\mashtronicsAI`.
 - Local venv at `.venv/` (`.venv\Scripts\python.exe`). **No NVIDIA GPU
-  locally** — CPU-only inference, which is why nano YOLO models are used and
-  why Kaggle is the validated workflow for actually running the pipeline.
-- RAM was tight in earlier sessions (15.63 GB total, ~3.67 GB free observed
-  at one point) — `--frame-stride` exists as an escape hatch if needed.
+  locally** — CPU-only inference/no training locally; Kaggle is the
+  validated workflow for anything involving the actual datasets or GPU
+  training.
+- Untracked in the repo root right now, all expected/known, none of them
+  need attention: `credentials.txt` (Roboflow API key, plaintext, user
+  has explicitly decided to keep using it rather than rotate — never add
+  to git), `output.txt`, `snapshots_video1/`, `snapshots_video3/` (the
+  Part-1-checkpoint exports reviewed in this session's step 1, kept for
+  reference).
 
 ## Kaggle workflow
 
-1. **New notebook** → Accelerator: GPU T4 → Internet: On. Given this
-   session's "start from the bottom" instruction, don't reuse an existing
-   notebook's leftover `/kaggle/working` state even if one happens to still
-   have files in it.
+1. **New notebook** → Accelerator: GPU T4 (only needed for actual
+   training steps; dataset-inspection-only steps run fine on CPU) →
+   Internet: On.
 2. `!git clone https://github.com/SMOKE484/mashtronicsAI.git && cd
-   mashtronicsAI && pip install -q -e .` — if the repo somehow already exists
-   in `/kaggle/working` (same session, re-run cell), `%cd
-   /kaggle/working/mashtronicsAI && !git pull` instead of re-cloning.
-   **Remember**: the local rewrite in this handover is not yet pushed to
-   GitHub — `git pull` won't have it until it's committed and pushed.
-3. For video: attach via "Add Input" → Dataset, then confirm the real mount
-   path with `find /kaggle/input/ -iname "*.mp4"` (the sidebar's displayed
-   path has been wrong before — missing a `datasets/<username>/` segment).
-4. **`/kaggle/working` does not survive across separate Kaggle sessions** —
-   only within one continuous session/disk. Anything worth keeping (trained
-   checkpoints especially) needs to be saved as a proper Kaggle Dataset, not
-   left sitting in `/kaggle/working`. This has already cost one checkpoint
-   once.
-5. Jupyter kernel gotcha: `!pip install -q -e .` doesn't get picked up by the
-   *already-running* kernel for a direct `from driveway_guard... import ...`
-   — only by new subprocess-spawned `python` processes (`!python -m ...` or
-   `subprocess.run([...])`). Fix for a cell that needs to import the package
-   directly: `sys.path.insert(0, "/kaggle/working/mashtronicsAI/src")` as
-   its first line.
+   mashtronicsAI && pip install -q -e .` — if re-running in an
+   already-cloned session, `%cd /kaggle/working/mashtronicsAI && !git
+   pull` instead of re-cloning. **Watch for accidental double-nesting**:
+   if `%cd mashtronicsAI` is run while already inside a `mashtronicsAI`
+   directory (e.g. re-running Cell 1 in a session that didn't actually
+   restart), `git clone` creates a nested `mashtronicsAI/mashtronicsAI`
+   copy. Not fatal — the freshly-cloned nested copy is still complete and
+   fine to use, just `%cd` into it and continue; no need to delete
+   anything or re-clone.
+3. For video: attach via "Add Input" → Dataset, then confirm the real
+   mount path with `find /kaggle/input/ -iname "*.mp4"` (sidebar's
+   displayed path has been wrong before). This session's actual path:
+   `/kaggle/input/datasets/vhulendamashamba/videos/<name>.mp4`.
+4. **`/kaggle/working` does not survive across separate Kaggle
+   sessions** — save any checkpoint worth keeping as a Kaggle Dataset or
+   download it immediately after training, before doing anything else.
+5. `!pip install -q -e .` doesn't get picked up by an *already-running*
+   kernel for direct `from driveway_guard... import ...` — only by new
+   subprocess-spawned `python` processes (`!python -m ...` or
+   `subprocess.run([...])`). Standalone scripts run via `!python
+   scripts/...` are unaffected by this and can be run right after
+   installing, same cell block or the next one.
+6. **Downloading a zipped output folder from an active session can
+   truncate/corrupt in transit** even when the zip is valid on Kaggle's
+   own filesystem (verify with `zipfile.ZipFile(...).testzip()` +
+   `ls -la` before assuming the zip itself is the problem). Easiest
+   workaround: skip downloading entirely and render images inline in the
+   notebook with `matplotlib`/`cv2` (see any of this session's "Cell 5"/
+   inline-viewer snippets), then screenshot the notebook output instead.
