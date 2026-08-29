@@ -40,6 +40,15 @@ silently dropping an unmapped class. A `class_map` value of `null` means
 negative example, if nothing else remains in its label file) -- use this to
 exclude a source class you don't want folded into any target class, e.g.
 {"Handgun": "weapon", "Knife": null, "Short_rifle": null}.
+
+An optional per-source `max_area_norm` dict caps how large (as a fraction of
+image area, width_norm * height_norm) a box may be for a given *target*
+class before it's dropped -- added to filter out a source whose boxes are
+scaled very differently from the rest (e.g. close-up product/stock photos
+mixed into an otherwise-CCTV dataset, where a "weapon" box can cover 20%+ of
+the frame vs. under 1% for an actual distant gun sighting), without having
+to drop that source's contribution to the class entirely:
+{"max_area_norm": {"weapon": 0.02}}
 """
 
 import argparse
@@ -93,11 +102,14 @@ def build_class_remap(
     return remap
 
 
-def remap_label_line(line: str, remap: dict[int, int | None]) -> str | None:
+def remap_label_line(
+    line: str, remap: dict[int, int | None], max_area_norm: dict[int, float] | None = None
+) -> str | None:
     """Rewrites a YOLO label line's leading class-index per remap. Returns
     None to drop the line -- either class_map explicitly maps this class to
-    None, or (shouldn't happen if build_class_remap covered every source
-    class) the id isn't in remap at all."""
+    None, the box's area exceeds max_area_norm for its target class, or
+    (shouldn't happen if build_class_remap covered every source class) the
+    id isn't in remap at all."""
     parts = line.split()
     if not parts:
         return None
@@ -108,6 +120,10 @@ def remap_label_line(line: str, remap: dict[int, int | None]) -> str | None:
     target_id = remap[local_id]
     if target_id is None:
         return None
+    if max_area_norm and target_id in max_area_norm:
+        width_norm, height_norm = float(parts[3]), float(parts[4])
+        if width_norm * height_norm > max_area_norm[target_id]:
+            return None
     parts[0] = str(target_id)
     return " ".join(parts)
 
@@ -118,6 +134,9 @@ def _merge_source(source: dict, target_classes: list[str], output: Path) -> dict
     prefix = source["name"]
     source_names = _load_source_names(data_yaml)
     remap = build_class_remap(source_names, source["class_map"], target_classes)
+    max_area_norm = {
+        target_classes.index(name): area for name, area in source.get("max_area_norm", {}).items()
+    }
 
     counts: dict[str, int] = {}
     for split in _SPLITS:
@@ -145,7 +164,7 @@ def _merge_source(source: dict, target_classes: list[str], output: Path) -> dict
             remapped_lines = [
                 remapped
                 for line in label_path.read_text().splitlines()
-                if (remapped := remap_label_line(line, remap)) is not None
+                if (remapped := remap_label_line(line, remap, max_area_norm)) is not None
             ]
             (out_labels_dir / f"{prefix}_{image_path.stem}.txt").write_text(
                 "\n".join(remapped_lines) + ("\n" if remapped_lines else "")
